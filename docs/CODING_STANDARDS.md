@@ -38,7 +38,7 @@ The only external dependency is Vapor. `Package.resolved` is committed. Adding a
 
 - Standard Swift formatting; no formatter is configured. Match the surrounding code.
 - Prefer `// MARK: -` section banners as in `main.swift` when growing the file.
-- Functions in `main.swift` are top-level and pure where possible (`systemInstructions`, `renderPrompt`). Keep new helpers in the same shape — they are unit-testable without booting Vapor.
+- Functions in `main.swift` are top-level and pure where possible (`systemInstructions`, `renderPrompt`, `augmentInstructionsForJSONObject`, `buildGenerationSchema`, `buildDynamicSchema`). Keep new helpers in the same shape — they are unit-testable without booting Vapor.
 
 ## Comments
 

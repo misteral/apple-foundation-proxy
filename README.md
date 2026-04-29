@@ -61,6 +61,37 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 `POST /v1/chat/completions` accepts a standard OpenAI request and returns a `chat.completion` response. `system`/`developer` messages are joined into `LanguageModelSession` instructions; the remaining conversation is rendered into a single prompt with the last `user` message as the immediate ask. A fresh session is created per request — there is no server-side conversation memory.
 
-Not implemented yet: streaming (`stream: true`), `tools` / `tool_choice`, `response_format`, `n > 1`, `logprobs`, multimodal content. `usage` token counts are reported as zeros because `FoundationModels` does not surface them.
+`response_format` is supported:
+
+- `{"type":"text"}` — default text generation.
+- `{"type":"json_object"}` — instruction-level "respond with JSON only" augmentation. FoundationModels has no native JSON mode, so the result is best-effort JSON.
+- `{"type":"json_schema","json_schema":{"name":"...","schema":{...}}}` — schema-enforced output via `LanguageModelSession.respond(to:schema:)`. The supported JSON Schema subset is `object` (with `properties`/`required`), `string` (with optional `enum`), `integer`, `number`, `boolean`, and `array` (with `items`/`minItems`/`maxItems`). `oneOf`/`anyOf`/`allOf`/`$ref`/`pattern`/`format`/`additionalProperties` are rejected with `400`.
+
+Example structured-output request:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"apple-foundation-model",
+    "messages":[{"role":"user","content":"Suggest one name for a black cat."}],
+    "response_format":{
+      "type":"json_schema",
+      "json_schema":{
+        "name":"CatName",
+        "schema":{
+          "type":"object",
+          "properties":{
+            "name":{"type":"string","description":"the suggested name"},
+            "confidence":{"type":"number"}
+          },
+          "required":["name"]
+        }
+      }
+    }
+  }'
+```
+
+Not implemented yet: streaming (`stream: true`), `tools` / `tool_choice`, `n > 1`, `logprobs`, multimodal content. `usage` token counts are reported as zeros because `FoundationModels` does not surface them.
 
 Note: Apple Foundation Models currently reports `ru_RU` as unsupported on the tested machine, so Russian output may be unreliable even though the endpoint works.

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Local OpenAI-compatible HTTP proxy that forwards requests to Apple's on-device `FoundationModels` framework. Single-process Swift Vapor app; the entire server lives in `Sources/apple-foundation-proxy/main.swift`. The chat endpoint is a minimal text-generation shim: `system`/`developer` messages become `LanguageModelSession` instructions, the rest of the conversation is rendered into a single prompt. Streaming, tool calls, and structured output are not implemented yet.
+Local OpenAI-compatible HTTP proxy that forwards requests to Apple's on-device `FoundationModels` framework. Single-process Swift Vapor app; the entire server lives in `Sources/apple-foundation-proxy/main.swift`. The chat endpoint is a text-generation shim: `system`/`developer` messages become `LanguageModelSession` instructions, the rest of the conversation is rendered into a single prompt. `response_format` is supported (`text`, `json_object`, `json_schema`). Streaming and tool calls are not implemented yet.
 
 ## How to use this file
 

@@ -16,10 +16,15 @@ There is no separate lint step; `swift build` is the type/syntax gate.
 
 ## What to test
 
-The pure helpers in `main.swift` are the high-leverage targets — they are deterministic and don't require `FoundationModels`:
+The pure helpers in `main.swift` are the high-leverage targets — they are deterministic and don't require `FoundationModels` at runtime:
 
 - `systemInstructions(from:)` — joins multiple `system`/`developer` messages, returns nil when none, ignores other roles.
-- `renderPrompt(from:)` — single-user-message passthrough, multi-turn transcript rendering, fallback when there is no `user` message, behavior when only `system` messages are present.
+- `renderPrompt(from:)` — single-user-message passthrough, multi-turn transcript rendering, `Assistant:` cue only when the last turn is `user`, behavior when only `system` messages are present.
+- `augmentInstructionsForJSONObject(_:)` — appends the JSON directive verbatim when no base instructions, joins with `\n\n` otherwise.
+- `JSONValue` decoding — primitives, arrays, objects, round-trip through `JSONEncoder`/`JSONDecoder`, accessor helpers.
+- `ChatCompletionRequest` decoding — verify `response_format` and nested `json_schema` decode from the OpenAI wire format.
+
+The `buildGenerationSchema(from:)` bridge requires `FoundationModels` types, so its tests are gated behind `#if canImport(FoundationModels)` and skip at runtime via `#available(macOS 26.0, *)` on older OSes. Cover both happy paths (object/array/enum/scalar) and the rejection cases (`oneOf`/`anyOf`/`allOf`/`$ref`/`pattern`/`format`/`additionalProperties`, missing `items`, unknown `type`, non-object fragment, missing `schema`).
 
 ## What not to test in unit tests
 

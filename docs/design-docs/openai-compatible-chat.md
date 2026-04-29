@@ -2,13 +2,19 @@
 
 ## Status
 
-The **basic text-generation shape** is implemented in `main.swift`: `messages` (system/developer → instructions, user/assistant → prompt-stuffed transcript), per-request `LanguageModelSession`, single non-streaming response. This doc covers what's still missing — streaming, tool calls, structured output — and the spike work needed before tackling them.
+Implemented in `main.swift`:
+
+- `messages` translation (system/developer → instructions, user/assistant → prompt-stuffed transcript).
+- Per-request `LanguageModelSession`, single non-streaming response.
+- `response_format`: `text`, `json_object` (instruction-augmented), `json_schema` (JSON Schema → `DynamicGenerationSchema` → `GenerationSchema(root:dependencies:)` → `respond(to:schema:)` → `GeneratedContent.jsonString`).
+
+This doc covers what's still missing — streaming, tool calls — and the spike work needed before tackling them.
 
 ## Endpoints
 
 | Path | Purpose | Behavior |
 |------|---------|----------|
-| `POST /v1/chat/completions` | General OpenAI-compatible chat | Today: basic `messages` → text response. Target: `tools`, `tool_choice`, `response_format`, `stream`, basic options. |
+| `POST /v1/chat/completions` | General OpenAI-compatible chat | Today: basic `messages` → text or structured response. Target adds: `tools`, `tool_choice`, `stream`, more sampling options. |
 | `GET /health` | Capability probe | Existing |
 
 ## Capability matrix

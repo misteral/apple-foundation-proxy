@@ -30,11 +30,11 @@ Priority: `P0` blocks correctness, `P1` blocks a real use case, `P2` is hygiene.
 **Why it matters:** clients that meter usage or cap requests by token budget will see zeros and either ignore the cap or refuse to bill. The field is present so decoding doesn't fail, but the values are dishonest.
 **Fix sketch:** if `FoundationModels` adds a token-count surface, plumb it through. Until then, consider a best-effort character-based estimate (e.g., `len/4`) behind a documented caveat, or omit `usage` entirely if Vapor's encoder permits.
 
-### [P2] Test target is a placeholder
-**Where:** `Tests/apple-foundation-proxyTests/apple_foundation_proxyTests.swift`
-**What:** the only `@Test` is a no-op. The pure helpers in `main.swift` (`systemInstructions`, `renderPrompt`) have no coverage.
-**Why it matters:** the helpers encode the message-translation contract for the OpenAI-compatible endpoint. A future agent could "simplify" them and silently change how `system`/`developer` messages or multi-turn history reach the model.
-**Fix sketch:** add Swift Testing cases for each pure helper. See `docs/TESTING.md` for what to cover.
+### [P2] Schema bridge tests don't exercise the model
+**Where:** `Tests/apple-foundation-proxyTests/apple_foundation_proxyTests.swift` — `BuildGenerationSchemaTests`
+**What:** the bridge tests verify that `buildGenerationSchema` constructs without throwing for valid input and rejects unsupported constructs, but they don't actually run a model request to confirm the produced schema yields conforming output.
+**Why it matters:** a schema that builds cleanly may still produce malformed output when the model generates against it (e.g., if a property name collides with framework reserved words, or `anyOf` enum values aren't quoted as expected). Without an integration test, regressions are caught only by hand-running `curl`.
+**Fix sketch:** add a separate integration target (gated, opt-in) that runs against Apple Intelligence on a developer machine and asserts the JSON output parses against a known schema. Skip in CI.
 
 ---
 

@@ -16,6 +16,14 @@ let package = Package(
                 .product(name: "Vapor", package: "vapor")
             ],
             path: "Sources"
+        ),
+        .testTarget(
+            name: "apple-foundation-proxyTests",
+            dependencies: [
+                "apple-foundation-proxy",
+                .product(name: "Vapor", package: "vapor"),
+            ],
+            path: "Tests/apple-foundation-proxyTests"
         )
     ]
 )
