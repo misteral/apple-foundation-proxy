@@ -297,7 +297,7 @@ import FoundationModels
 
     @Test func rejectsUnsupportedConstructs() throws {
         guard #available(macOS 26.0, *) else { return }
-        for unsupported in ["oneOf", "anyOf", "allOf", "$ref", "pattern", "format", "additionalProperties"] {
+        for unsupported in ["oneOf", "anyOf", "allOf", "$ref", "pattern", "format"] {
             let schema: JSONValue = .object([
                 "type": .string("object"),
                 unsupported: .array([]),
@@ -305,6 +305,42 @@ import FoundationModels
             #expect(throws: Abort.self, "should reject \(unsupported)") {
                 try buildGenerationSchema(from: spec(schema, name: "Bad_\(unsupported)"))
             }
+        }
+    }
+
+    @Test func acceptsAdditionalPropertiesFalse() throws {
+        guard #available(macOS 26.0, *) else { return }
+        let schema: JSONValue = .object([
+            "type": .string("object"),
+            "properties": .object([
+                "name": .object(["type": .string("string")]),
+            ]),
+            "required": .array([.string("name")]),
+            "additionalProperties": .bool(false),
+        ])
+        // Strict-mode OpenAI schemas always include this; it must build cleanly.
+        _ = try buildGenerationSchema(from: spec(schema, name: "Strict"))
+    }
+
+    @Test func rejectsAdditionalPropertiesTrue() throws {
+        guard #available(macOS 26.0, *) else { return }
+        let schema: JSONValue = .object([
+            "type": .string("object"),
+            "additionalProperties": .bool(true),
+        ])
+        #expect(throws: Abort.self) {
+            try buildGenerationSchema(from: spec(schema, name: "Open"))
+        }
+    }
+
+    @Test func rejectsAdditionalPropertiesAsObject() throws {
+        guard #available(macOS 26.0, *) else { return }
+        let schema: JSONValue = .object([
+            "type": .string("object"),
+            "additionalProperties": .object(["type": .string("string")]),
+        ])
+        #expect(throws: Abort.self) {
+            try buildGenerationSchema(from: spec(schema, name: "Typed"))
         }
     }
 

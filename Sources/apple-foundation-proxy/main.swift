@@ -220,7 +220,27 @@ func buildDynamicSchema(name: String, description: String?, schema: JSONValue) t
         throw Abort(.badRequest, reason: "Schema fragment '\(name)' must be a JSON object")
     }
 
-    for unsupported in ["oneOf", "anyOf", "allOf", "$ref", "pattern", "format", "additionalProperties"] {
+    // `additionalProperties: false` is the canonical OpenAI strict-mode pattern and is a
+    // no-op for us — DynamicGenerationSchema already produces closed objects. `true` (or
+    // any non-bool, e.g. a typed extension schema) we cannot model.
+    if let additional = dict["additionalProperties"] {
+        switch additional {
+        case .bool(false):
+            break
+        case .bool(true):
+            throw Abort(
+                .badRequest,
+                reason: "JSON Schema 'additionalProperties: true' is not supported (at '\(name)')"
+            )
+        default:
+            throw Abort(
+                .badRequest,
+                reason: "JSON Schema 'additionalProperties' must be a boolean (at '\(name)')"
+            )
+        }
+    }
+
+    for unsupported in ["oneOf", "anyOf", "allOf", "$ref", "pattern", "format"] {
         if dict[unsupported] != nil {
             throw Abort(
                 .badRequest,

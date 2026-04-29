@@ -42,8 +42,9 @@ History is prompt-stuffed rather than handed to a `Transcript` API because (a) t
 | `type: "string"` with `enum` | `DynamicGenerationSchema(name:description:anyOf:)` over the string values |
 | `type: "integer"` / `"number"` / `"boolean"` | `DynamicGenerationSchema(type: Int.self / Double.self / Bool.self)` |
 | `type: "array"` with `items`, optional `minItems`/`maxItems` | `DynamicGenerationSchema(arrayOf:minimumElements:maximumElements:)` |
+| `additionalProperties: false` | Accepted, ignored — `DynamicGenerationSchema` already produces closed objects, so this is a no-op. Required by the OpenAI `strict: true` convention. |
 
-Rejected with `400` (initial release): `oneOf`, `anyOf`, `allOf`, `$ref`, `pattern`, `format`, `additionalProperties`. Property `description` strings are forwarded into `DynamicGenerationSchema.Property.description`.
+Rejected with `400` (initial release): `oneOf`, `anyOf`, `allOf`, `$ref`, `pattern`, `format`, `additionalProperties: true`, and `additionalProperties` set to anything other than a boolean (e.g. a typed extension schema). Property `description` strings are forwarded into `DynamicGenerationSchema.Property.description`.
 
 ## Dual-mode build
 

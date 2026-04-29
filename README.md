@@ -65,7 +65,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 - `{"type":"text"}` — default text generation.
 - `{"type":"json_object"}` — instruction-level "respond with JSON only" augmentation. FoundationModels has no native JSON mode, so the result is best-effort JSON.
-- `{"type":"json_schema","json_schema":{"name":"...","schema":{...}}}` — schema-enforced output via `LanguageModelSession.respond(to:schema:)`. The supported JSON Schema subset is `object` (with `properties`/`required`), `string` (with optional `enum`), `integer`, `number`, `boolean`, and `array` (with `items`/`minItems`/`maxItems`). `oneOf`/`anyOf`/`allOf`/`$ref`/`pattern`/`format`/`additionalProperties` are rejected with `400`.
+- `{"type":"json_schema","json_schema":{"name":"...","schema":{...}}}` — schema-enforced output via `LanguageModelSession.respond(to:schema:)`. The supported JSON Schema subset is `object` (with `properties`/`required`), `string` (with optional `enum`), `integer`, `number`, `boolean`, and `array` (with `items`/`minItems`/`maxItems`). `additionalProperties: false` (the OpenAI `strict: true` convention) is accepted as a no-op. Rejected with `400`: `oneOf`/`anyOf`/`allOf`/`$ref`/`pattern`/`format` and `additionalProperties: true` (or any non-boolean value).
 
 Example structured-output request:
 
