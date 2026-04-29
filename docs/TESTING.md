@@ -18,10 +18,8 @@ There is no separate lint step; `swift build` is the type/syntax gate.
 
 The pure helpers in `main.swift` are the high-leverage targets — they are deterministic and don't require `FoundationModels`:
 
-- `latestUserContent(from:)` — message selection, fallback when no `user` role exists.
-- `extractDictationText(from:)` — instruction-prefix stripping for both English and Russian, behavior when no `:` is present, whitespace trimming.
-- `makeCorrectionPrompt(for:)` — output contains the input and the forbid-translation directives.
-- `cleanModelOutput(_:)` — XML tag stripping, surrounding-quote stripping, the "exactly one quote on each side" edge case, whitespace handling.
+- `systemInstructions(from:)` — joins multiple `system`/`developer` messages, returns nil when none, ignores other roles.
+- `renderPrompt(from:)` — single-user-message passthrough, multi-turn transcript rendering, fallback when there is no `user` message, behavior when only `system` messages are present.
 
 ## What not to test in unit tests
 
@@ -35,9 +33,10 @@ swift run &  # in another terminal
 curl -s http://127.0.0.1:8080/health | python3 -m json.tool
 curl -s http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"apple-foundation-model","messages":[{"role":"user","content":"i went too the store and buyed milk yesterday"}]}'
+  -d '{"model":"apple-foundation-model","messages":[{"role":"system","content":"You are concise."},{"role":"user","content":"Name three primary colors."}]}'
 ```
 
 Confirm that:
 - `/health` reports `runtimeSupported: true` and `modelAvailability: "available"` on an Apple Intelligence-capable Mac.
-- The chat response strips quotes/tags and stays in the input language (try a Russian sentence too — see locale notes in `docs/RELIABILITY.md`).
+- The chat response is a sensible answer that respects the `system` message (try with and without a `system` message).
+- Multi-turn requests (a `user`/`assistant`/`user` sequence) produce output that reflects the prior turns.

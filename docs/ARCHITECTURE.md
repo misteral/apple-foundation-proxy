@@ -17,19 +17,18 @@ Two endpoints, both on `127.0.0.1:8080`:
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET`  | `/health` | Reports `FoundationModels` import status, runtime availability, and which locales `SystemLanguageModel.default` supports on the host. |
-| `POST` | `/v1/chat/completions` | OpenAI-shaped request/response envelope wrapping a single fixed task: dictation correction. |
+| `POST` | `/v1/chat/completions` | OpenAI-shaped request/response envelope. Generates text from `messages` via `LanguageModelSession`. |
 
-The OpenAI compatibility is **shape only**. Missing on purpose: `usage`, `finish_reason`, streaming, multi-turn history, tool calls, function calling, system messages.
+The OpenAI compatibility covers the basic text-generation request/response shape. Missing on purpose for now: streaming, `tools` / `tool_choice`, `response_format`, `n > 1`, `logprobs`, multimodal content. `usage` is returned with zero counts because `FoundationModels` does not expose token usage.
 
 ## Request pipeline for `/v1/chat/completions`
 
-1. **`latestUserContent`** — picks the most recent `user` message; falls back to the last message of any role. Earlier turns are ignored.
-2. **`extractDictationText`** — if the message starts with an instruction prefix (`"Исправь:"`, `"Correct:"`, `"Fix:"`, `"Clean up:"`, `"Rewrite:"`, etc.) followed by `:`, strips the prefix so a caller can prepend an instruction without it leaking into the model input.
-3. **`makeCorrectionPrompt`** — wraps the text in a fixed correction prompt that forbids translation/explanation/quotes/XML.
-4. **`LanguageModelSession(instructions:)`** — a fresh session is created **per request**. There is no streaming, no conversation state, and no tools. System-style guidance is passed via `instructions:` in addition to being repeated in the prompt body (belt-and-braces against drift).
-5. **`cleanModelOutput`** — strips the `<dictation>` / `<text>` / `<corrected>` tags and surrounding `"` quotes that the model occasionally emits despite instructions.
+1. **`systemInstructions`** — joins all `system` and `developer` role messages into one instructions block (newline-separated). Returns nil when the request has none.
+2. **`renderPrompt`** — renders the remaining `user`/`assistant` history as a labeled transcript and appends the last user message as the immediate ask. When there's only one user message it's used verbatim with no transcript framing.
+3. **`LanguageModelSession`** — a fresh session is created **per request**. Constructed with `instructions:` when `systemInstructions` returned a value, otherwise with no instructions. There is no streaming, no conversation state across requests, and no tools.
+4. The session's `respond(to:)` output is returned in `choices[0].message.content` as-is.
 
-The redundant instruction layering and the output-stripping step are not stylistic — see `docs/design-docs/dictation-only-endpoint.md` for the rationale.
+History is prompt-stuffed rather than handed to a `Transcript` API because (a) the proxy is intentionally stateless and (b) the public surface of `Transcript` for arbitrary multi-turn rehydration hasn't been validated yet — see `docs/design-docs/openai-compatible-chat.md` for the forward-looking design.
 
 ## Dual-mode build
 
@@ -55,7 +54,6 @@ On older toolchains, `/v1/chat/completions` returns a `[Mock Apple Intelligence 
 
 ## What this project is not
 
-- Not a general-purpose OpenAI proxy. The OpenAI shape is a convenience for clients that already speak it.
-- Not a chat assistant. There is no memory across requests by design.
-- Not a translation service. The prompt explicitly forbids language changes; Russian and English (and other locales reported as supported by `SystemLanguageModel`) stay in their original language.
+- Not a full OpenAI emulator. The OpenAI shape is a calling convention; advanced features (streaming, tools, structured output, vision) are not implemented.
+- Not a chat assistant with memory. There is no server-side state across requests by design — clients send the full message history each turn.
 - Not production-ready as a network service. Local-only; see `docs/SECURITY.md`.

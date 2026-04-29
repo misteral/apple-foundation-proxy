@@ -5,8 +5,7 @@ Catalogue of design decisions. Add new docs here when changing a load-bearing in
 | Doc | Summary |
 |-----|---------|
 | [core-beliefs.md](core-beliefs.md) | Operating principles for this project: scope, honesty about limits, dual-mode build. |
-| [dictation-only-endpoint.md](dictation-only-endpoint.md) | Why the original `/v1/chat/completions` was hard-wired to dictation correction. Superseded for the general path by `openai-compatible-chat.md`; still authoritative for the dictation endpoint. |
-| [openai-compatible-chat.md](openai-compatible-chat.md) | Architecture for a general OpenAI-compatible `/v1/chat/completions` supporting streaming, tool calls, and structured output. Active execution plan: `docs/exec-plans/active/openai-compatible-chat.md`. |
+| [openai-compatible-chat.md](openai-compatible-chat.md) | Forward-looking architecture for `/v1/chat/completions` covering streaming, tool calls, and structured output. The basic text-generation shape is already implemented in `main.swift`; this doc covers what's still missing. |
 
 ## When to add a design doc
 

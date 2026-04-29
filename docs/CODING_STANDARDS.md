@@ -22,21 +22,15 @@ if #available(macOS 26.0, *) { ... }
 
 **Why:** the package floor is `macOS 14`, but `FoundationModels` requires macOS 26. Removing either guard breaks the build on older toolchains and CI.
 
-### 2. The model prompt and `instructions:` block are intentionally repetitive
-
-`makeCorrectionPrompt` and the `LanguageModelSession(instructions:)` block both forbid translation, explanation, quotes, and XML. This is **not** redundancy to clean up. The on-device model occasionally honors one and not the other; the duplication is a regression guard.
-
-If the model still drifts, fix it in `cleanModelOutput` (post-processing), not by relaxing the prompt.
-
-### 3. `LanguageModelSession` is created per request
+### 2. `LanguageModelSession` is created per request
 
 There is no shared `LanguageModelSession`, no session pool, and no conversation state. Adding any of these is a design change — see `docs/RELIABILITY.md` and open a design doc in `docs/design-docs/` first.
 
-### 4. Server binds to `127.0.0.1`
+### 3. Server binds to `127.0.0.1`
 
 The port is `8080` and the bind is local-only. The proxy has no auth, no rate limiting, and runs on-device against the user's Apple Intelligence quota. See `docs/SECURITY.md`.
 
-### 5. Dependency surface
+### 4. Dependency surface
 
 The only external dependency is Vapor. `Package.resolved` is committed. Adding a dependency requires a note in `docs/exec-plans/tech-debt-tracker.md` and a reason — most utility code is small enough to inline.
 
@@ -44,8 +38,8 @@ The only external dependency is Vapor. `Package.resolved` is committed. Adding a
 
 - Standard Swift formatting; no formatter is configured. Match the surrounding code.
 - Prefer `// MARK: -` section banners as in `main.swift` when growing the file.
-- Functions in `main.swift` are top-level and pure where possible (`latestUserContent`, `extractDictationText`, `makeCorrectionPrompt`, `cleanModelOutput`). Keep new helpers in the same shape — they are unit-testable without booting Vapor.
+- Functions in `main.swift` are top-level and pure where possible (`systemInstructions`, `renderPrompt`). Keep new helpers in the same shape — they are unit-testable without booting Vapor.
 
 ## Comments
 
-Comments in `main.swift` exist where the *why* is non-obvious — the macOS 26 gating, the mock fallback, the "treat the endpoint as a local dictation cleanup service" line. Don't add comments that restate code; do add comments when you encode an invariant a future agent might "clean up."
+Comments in `main.swift` exist where the *why* is non-obvious — the macOS 26 gating, the mock fallback, why `usage` token counts are zero. Don't add comments that restate code; do add comments when you encode an invariant a future agent might "clean up."

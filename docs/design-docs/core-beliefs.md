@@ -22,8 +22,4 @@ This is a feature, not technical debt. Keep it.
 
 ## 4. The OpenAI shape is a calling convention, not a contract
 
-Clients use OpenAI shapes because their HTTP plumbing already understands them — that is the only reason this server speaks them. Do not feel obligated to grow into a full OpenAI emulator (streaming, `usage`, function calling, vision). Add fields when a real client needs them; otherwise leave the response minimal.
-
-## 5. Prompt-hardening lives in three layers
-
-`instructions:`, the prompt body, and `cleanModelOutput`. They overlap on purpose. When the model misbehaves, add to `cleanModelOutput`; do not loosen the upstream layers to "let the model breathe." The model has been observed to drift in exactly the ways the current text guards against.
+Clients use OpenAI shapes because their HTTP plumbing already understands them — that is the only reason this server speaks them. Do not feel obligated to grow into a full OpenAI emulator (streaming, function calling, vision, real `usage` token counts). Add fields when a real client needs them; otherwise leave the response minimal.

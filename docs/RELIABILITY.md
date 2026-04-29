@@ -4,7 +4,7 @@
 
 Every request to `/v1/chat/completions` constructs a fresh `LanguageModelSession`. This is intentional:
 
-- The endpoint is for one-shot dictation correction — there is no conversation to retain.
+- The proxy is stateless by design — clients are expected to send the full conversation history each turn (matching OpenAI's contract).
 - A long-lived session would accumulate state across unrelated callers (an editor and a clipboard tool, say) and silently bias outputs.
 - Session construction is cheap relative to model inference.
 
@@ -12,12 +12,7 @@ If you ever want to reuse a session, it must be scoped per logical client (e.g.,
 
 ## No streaming
 
-The endpoint returns the full corrected text in a single JSON response. Streaming is omitted because:
-
-- Dictation correction outputs are short (sentence-scale).
-- OpenAI-compatible streaming requires SSE plumbing that adds surface area for clients that already work with the non-streaming response.
-
-If a real use case for streaming appears, it should be additive (`stream: true` opt-in), not a replacement.
+The endpoint returns the full response text in a single JSON response. `stream: true` is not implemented yet — it should be additive (opt-in via the request flag) when added, not a replacement for the non-streaming path. See `docs/design-docs/openai-compatible-chat.md` for the forward-looking design.
 
 ## Locale support
 

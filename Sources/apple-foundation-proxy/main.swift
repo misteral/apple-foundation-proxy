@@ -24,12 +24,19 @@ struct ChatCompletionResponse: Content {
         }
         let index: Int
         let message: Message
+        let finish_reason: String
+    }
+    struct Usage: Content {
+        let prompt_tokens: Int
+        let completion_tokens: Int
+        let total_tokens: Int
     }
     let id: String
     let object: String
     let created: Int
     let model: String
     let choices: [Choice]
+    let usage: Usage
 }
 
 struct HealthResponse: Content {
@@ -43,60 +50,43 @@ struct HealthResponse: Content {
     let ruRUSupported: Bool?
 }
 
-// MARK: - Prompt Helpers
+// MARK: - Prompt assembly
 
-func latestUserContent(from messages: [ChatCompletionRequest.Message]) -> String {
-    messages.last(where: { $0.role == "user" })?.content ?? messages.last?.content ?? ""
+/// Joins `system` and `developer` role messages into a single instructions block.
+/// Returns nil when there are none so the caller can construct a session without instructions.
+func systemInstructions(from messages: [ChatCompletionRequest.Message]) -> String? {
+    let parts = messages
+        .filter { $0.role == "system" || $0.role == "developer" }
+        .map(\.content)
+    guard !parts.isEmpty else { return nil }
+    return parts.joined(separator: "\n\n")
 }
 
-func extractDictationText(from text: String) -> String {
-    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    let lowercased = trimmed.lowercased()
-    let instructionPrefixes = [
-        "исправь", "поправь", "отредактируй", "почини",
-        "correct", "fix", "clean up", "rewrite"
-    ]
+/// Renders the conversation as a single prompt string.
+///
+/// The last `user`/`assistant` turn becomes the immediate prompt; earlier turns are prepended
+/// as a labeled transcript so the model sees the history. `system`/`developer` messages are
+/// handled separately via `Instructions` and are excluded here.
+///
+/// Prompt-stuffing the history is intentional: it keeps the proxy stateless across requests
+/// (no `LanguageModelSession` reuse) at the cost of growing prompts on long conversations.
+func renderPrompt(from messages: [ChatCompletionRequest.Message]) -> String {
+    let convo = messages.filter { $0.role == "user" || $0.role == "assistant" }
+    guard let last = convo.last else { return "" }
+    let history = convo.dropLast()
 
-    if instructionPrefixes.contains(where: { lowercased.hasPrefix($0) }),
-       let colonIndex = trimmed.firstIndex(of: ":") {
-        return String(trimmed[trimmed.index(after: colonIndex)...])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    if history.isEmpty {
+        return last.content
     }
 
-    return trimmed
-}
-
-func makeCorrectionPrompt(for text: String) -> String {
-    """
-    Correct the dictation text below.
-    You MUST preserve the original language and meaning.
-    If the text is Russian, respond in Russian.
-    Do NOT translate.
-    Do NOT explain.
-    Do NOT add XML/Markdown/quotes.
-    Return ONLY the corrected text.
-
-    TEXT TO CORRECT:
-    \(text)
-    """
-}
-
-func cleanModelOutput(_ text: String) -> String {
-    var cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
-
-    for tag in ["dictation", "text", "corrected"] {
-        cleaned = cleaned.replacingOccurrences(of: "<\(tag)>", with: "")
-        cleaned = cleaned.replacingOccurrences(of: "</\(tag)>", with: "")
+    var lines: [String] = []
+    for msg in history {
+        let label = msg.role == "user" ? "User" : "Assistant"
+        lines.append("\(label): \(msg.content)")
     }
-
-    cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
-
-    if cleaned.hasPrefix("\"") && cleaned.hasSuffix("\"") && cleaned.count >= 2 {
-        cleaned.removeFirst()
-        cleaned.removeLast()
-    }
-
-    return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    lines.append("User: \(last.content)")
+    lines.append("Assistant:")
+    return lines.joined(separator: "\n")
 }
 
 // MARK: - Main Application
@@ -106,15 +96,14 @@ struct FoundationModelsProxy {
     static func main() async throws {
         var env = try Environment.detect()
         try LoggingSystem.bootstrap(from: &env)
-        
+
         let app = try await Application.make(env)
         defer {
             Task {
                 try? await app.asyncShutdown()
             }
         }
-        
-        // Change port to something distinct so it doesn't conflict easily
+
         app.http.server.configuration.port = 8080
         app.logger.info("Starting Apple FoundationModels proxy on http://127.0.0.1:8080")
 
@@ -149,53 +138,57 @@ struct FoundationModelsProxy {
 
         app.post("v1", "chat", "completions") { req async throws -> ChatCompletionResponse in
             let payload = try req.content.decode(ChatCompletionRequest.self)
-            
-            // For this first version, treat the endpoint as a local dictation cleanup service.
-            let rawUserText = latestUserContent(from: payload.messages)
-            let dictationText = extractDictationText(from: rawUserText)
-            let prompt = makeCorrectionPrompt(for: dictationText)
-            
+
+            let instructions = systemInstructions(from: payload.messages)
+            let prompt = renderPrompt(from: payload.messages)
+
             var generatedText = "FoundationModels framework is not available or not supported on this OS version."
-            
+            var finishReason = "stop"
+
             #if canImport(FoundationModels)
-            // FoundationModels is available starting macOS 26+ / iOS 26+ (Apple Intelligence).
             if #available(macOS 26.0, *) {
                 do {
-                    let instructions = """
-                    You are a strict text correction engine.
-                    ALWAYS correct dictation mistakes, typos, punctuation, and casing.
-                    ALWAYS preserve the user's original language and meaning.
-                    NEVER translate.
-                    NEVER explain.
-                    NEVER add quotes.
-                    Return ONLY the corrected text.
-                    """
-
-                    let session = LanguageModelSession(instructions: instructions)
+                    let session: LanguageModelSession
+                    if let instructions {
+                        session = LanguageModelSession(instructions: instructions)
+                    } else {
+                        session = LanguageModelSession()
+                    }
                     let response = try await session.respond(to: prompt)
-                    generatedText = cleanModelOutput(response.content)
+                    generatedText = response.content
                 } catch {
                     app.logger.error("FoundationModels Error: \(error)")
                     generatedText = "Error during generation: \(error.localizedDescription)"
+                    finishReason = "error"
                 }
             }
             #else
-            // Fallback mock logic when building on older Xcode/macOS
+            // Fallback mock when building on toolchains without FoundationModels.
             app.logger.warning("Mocking response since FoundationModels cannot be imported.")
-            generatedText = "[Mock Apple Intelligence Response] I corrected your text: \(dictationText)"
+            generatedText = "[Mock Apple Intelligence Response] \(prompt)"
             #endif
 
             let choice = ChatCompletionResponse.Choice(
                 index: 0,
-                message: .init(role: "assistant", content: generatedText)
+                message: .init(role: "assistant", content: generatedText),
+                finish_reason: finishReason
+            )
+
+            // FoundationModels does not expose token counts; report zeros so clients that
+            // require the `usage` field don't fail to decode the response.
+            let usage = ChatCompletionResponse.Usage(
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0
             )
 
             return ChatCompletionResponse(
-                id: UUID().uuidString,
+                id: "chatcmpl-\(UUID().uuidString)",
                 object: "chat.completion",
                 created: Int(Date().timeIntervalSince1970),
                 model: payload.model ?? "apple-foundation-model",
-                choices: [choice]
+                choices: [choice],
+                usage: usage
             )
         }
 

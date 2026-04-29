@@ -19,7 +19,7 @@ Each item below is a prerequisite, not a nice-to-have. Do not skip any:
 
 1. **Auth.** A bearer token check on `/v1/chat/completions`, with the secret read from env or Keychain — never hard-coded.
 2. **Rate limiting.** `LanguageModelSession` has finite throughput and shares the user's Apple Intelligence quota; a noisy client will starve everything else on the Mac.
-3. **Request size cap.** Vapor's default body limit is generous; lower it (a few KB is plenty for dictation).
+3. **Request size cap.** Vapor's default body limit is generous; pick a ceiling that matches the longest realistic conversation history you expect a client to send and reject larger bodies — unbounded prompt-stuffing on long histories will burn the user's Apple Intelligence quota.
 4. **Logging discipline.** Decide explicitly whether prompts/responses are logged. The current default of "method/path only" is the safe baseline — opt-in to body logging only with a flag and a warning.
 5. **Locale gating.** `SystemLanguageModel.default.supportsLocale(...)` should reject inputs in unsupported locales rather than silently producing low-quality output.
 

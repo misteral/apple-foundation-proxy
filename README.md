@@ -51,16 +51,16 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{
     "model": "apple-foundation-model",
     "messages": [
-      {
-        "role": "user",
-        "content": "Correct this dictated text: i went too the store and buyed milk yesterday"
-      }
+      {"role": "system", "content": "You are a concise assistant."},
+      {"role": "user", "content": "Give me three names for a black cat."}
     ]
   }'
 ```
 
 ## Current behavior
 
-This first version is intentionally narrow: it treats the latest user message as dictation text to clean up, sends it to `LanguageModelSession`, and returns a minimal OpenAI-style `chat.completion` response.
+`POST /v1/chat/completions` accepts a standard OpenAI request and returns a `chat.completion` response. `system`/`developer` messages are joined into `LanguageModelSession` instructions; the remaining conversation is rendered into a single prompt with the last `user` message as the immediate ask. A fresh session is created per request — there is no server-side conversation memory.
 
-Note: Apple Foundation Models currently reports `ru_RU` as unsupported on the tested machine, so Russian correction may be unreliable even though the endpoint works.
+Not implemented yet: streaming (`stream: true`), `tools` / `tool_choice`, `response_format`, `n > 1`, `logprobs`, multimodal content. `usage` token counts are reported as zeros because `FoundationModels` does not surface them.
+
+Note: Apple Foundation Models currently reports `ru_RU` as unsupported on the tested machine, so Russian output may be unreliable even though the endpoint works.

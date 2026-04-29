@@ -1,20 +1,15 @@
 # OpenAI-compatible chat completions over FoundationModels
 
-## Decision
+## Status
 
-Add a **general** OpenAI-compatible chat completions endpoint that supports streaming, tool calls, and structured output, alongside the existing dictation-only endpoint. The new endpoint is the canonical `POST /v1/chat/completions`; the dictation behavior moves to its own sibling path.
+The **basic text-generation shape** is implemented in `main.swift`: `messages` (system/developer → instructions, user/assistant → prompt-stuffed transcript), per-request `LanguageModelSession`, single non-streaming response. This doc covers what's still missing — streaming, tool calls, structured output — and the spike work needed before tackling them.
 
-This supersedes the "OpenAI shape is just a calling convention" framing in `dictation-only-endpoint.md` for the general endpoint only — the dictation endpoint's narrowness still stands and stays at `POST /v1/dictation/correct`.
-
-## Endpoints after this work
+## Endpoints
 
 | Path | Purpose | Behavior |
 |------|---------|----------|
-| `POST /v1/chat/completions` | General OpenAI-compatible chat | Honors `messages` history, `tools`, `tool_choice`, `response_format`, `stream`, basic options |
-| `POST /v1/dictation/correct` | Existing dictation correction | Unchanged from today's `/v1/chat/completions` (latest user message → fixed correction prompt → cleaned output) |
+| `POST /v1/chat/completions` | General OpenAI-compatible chat | Today: basic `messages` → text response. Target: `tools`, `tool_choice`, `response_format`, `stream`, basic options. |
 | `GET /health` | Capability probe | Existing |
-
-The dictation logic moves to its own path so the general endpoint isn't burdened with detection heuristics. Clients pinned to the old behavior need a one-line URL update; that breakage is acceptable for a single-author project at this stage.
 
 ## Capability matrix
 
