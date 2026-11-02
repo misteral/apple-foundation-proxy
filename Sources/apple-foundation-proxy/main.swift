@@ -97,6 +97,46 @@ struct ChatCompletionRequest: Content {
         let tool_call_id: String?
         let name: String?
 
+        enum CodingKeys: String, CodingKey {
+            case role, content, tool_calls, tool_call_id, name
+        }
+
+        /// One element of OpenAI's array-form `content`.
+        private struct ContentPart: Decodable {
+            let type: String
+            let text: String?
+        }
+
+        /// Accepts `content` as a string, `null`, or an array of parts. Text parts are joined
+        /// with newlines. Clients such as LangChain and the Agents SDK send the array form even
+        /// for plain text. Any other part type (images, audio, files) fails decoding, which
+        /// Vapor reports as a 400: the on-device model is text-only.
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            role = try c.decode(String.self, forKey: .role)
+            tool_calls = try c.decodeIfPresent([ToolCall].self, forKey: .tool_calls)
+            tool_call_id = try c.decodeIfPresent(String.self, forKey: .tool_call_id)
+            name = try c.decodeIfPresent(String.self, forKey: .name)
+
+            if (try? c.decodeNil(forKey: .content)) ?? true {
+                content = nil
+            } else if let text = try? c.decode(String.self, forKey: .content) {
+                content = text
+            } else {
+                let parts = try c.decode([ContentPart].self, forKey: .content)
+                content = try parts.map { part in
+                    guard part.type == "text", let text = part.text else {
+                        throw DecodingError.dataCorruptedError(
+                            forKey: .content,
+                            in: c,
+                            debugDescription: "Unsupported content part type '\(part.type)'; only 'text' parts are supported"
+                        )
+                    }
+                    return text
+                }.joined(separator: "\n")
+            }
+        }
+
         init(
             role: String,
             content: String?,
@@ -552,6 +592,124 @@ func makeToolCallID() -> String {
     "call_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24).lowercased()
 }
 
+// MARK: - Request preparation
+
+/// Everything the chat handler derives from a request before touching FoundationModels.
+/// `prepareCompletion` does all request validation, so every 400 is decided here and can be
+/// unit-tested without booting Vapor or the model.
+struct PreparedCompletion {
+    let formatType: String
+    let schemaSpec: ChatCompletionRequest.JSONSchemaSpec?
+    let instructions: String?
+    let prompt: String
+    /// Tools to attach to the session (after `tool_choice`).
+    let activeTools: [ChatCompletionRequest.ToolDefinition]
+    /// Non-nil → tool pipeline (native transcript + replay); nil → prompt stuffing.
+    let conversation: ToolConversation?
+    let stream: Bool
+    let includeUsage: Bool
+    let model: String
+}
+
+func prepareCompletion(_ payload: ChatCompletionRequest) throws -> PreparedCompletion {
+    let format = payload.response_format
+    let formatType = format?.type ?? "text"
+    guard ["text", "json_object", "json_schema"].contains(formatType) else {
+        throw Abort(.badRequest, reason: "Unsupported response_format.type: '\(formatType)'")
+    }
+    if formatType == "json_schema", format?.json_schema == nil {
+        throw Abort(.badRequest, reason: "response_format.type='json_schema' requires response_format.json_schema")
+    }
+
+    let baseInstructions = systemInstructions(from: payload.messages)
+    var instructions: String? = (formatType == "json_object")
+        ? augmentInstructionsForJSONObject(baseInstructions)
+        : baseInstructions
+
+    let requestedTools = payload.tools ?? []
+    let toolChoice = try parseToolChoice(payload.tool_choice)
+    let activeTools = try selectTools(requestedTools, choice: toolChoice)
+    let conversation: ToolConversation? = needsToolPipeline(tools: requestedTools, messages: payload.messages)
+        ? try splitToolConversation(payload.messages)
+        : nil
+
+    if !activeTools.isEmpty, let directive = toolChoiceDirective(toolChoice) {
+        instructions = [instructions, directive].compactMap { $0 }.joined(separator: "\n\n")
+    }
+
+    let prompt: String
+    if let conversation {
+        // Results for tools that aren't attached this turn can't be replayed via
+        // `ProxyTool`; hand them to the model as text instead.
+        let activeNames = Set(activeTools.map(\.function.name))
+        let unreplayable = conversation.pendingResults.filter { !activeNames.contains($0.name) }
+        prompt = appendToolResultsToPrompt(conversation.prompt, results: unreplayable)
+    } else {
+        prompt = renderPrompt(from: payload.messages)
+    }
+
+    return PreparedCompletion(
+        formatType: formatType,
+        schemaSpec: formatType == "json_schema" ? format?.json_schema : nil,
+        instructions: instructions,
+        prompt: prompt,
+        activeTools: activeTools,
+        conversation: conversation,
+        stream: payload.stream == true,
+        includeUsage: payload.stream_options?.include_usage == true,
+        model: payload.model ?? "apple-foundation-model"
+    )
+}
+
+/// Result of one generation, independent of how it's delivered (JSON or SSE).
+struct CompletionOutcome: Equatable {
+    let content: String?
+    let toolCalls: [ToolInvocationRecorder.Invocation]
+    let finishReason: String
+
+    static func text(_ content: String, finishReason: String = "stop") -> CompletionOutcome {
+        .init(content: content, toolCalls: [], finishReason: finishReason)
+    }
+}
+
+/// Mock reply for toolchains without FoundationModels, so the project builds and answers in
+/// CI and on machines without Apple Intelligence.
+func mockCompletionOutcome(_ prepared: PreparedCompletion) -> CompletionOutcome {
+    if prepared.formatType == "json_object" || prepared.formatType == "json_schema" {
+        return .text("{\"mock\":true}")
+    }
+    return .text("[Mock Apple Intelligence Response] \(prepared.prompt)")
+}
+
+let unavailableCompletionOutcome = CompletionOutcome.text(
+    "FoundationModels framework is not available or not supported on this OS version."
+)
+
+func makeCompletionResponse(
+    _ outcome: CompletionOutcome,
+    id: String,
+    created: Int,
+    model: String
+) -> ChatCompletionResponse {
+    let toolCalls: [ChatCompletionRequest.ToolCall]? = outcome.toolCalls.isEmpty ? nil : outcome.toolCalls.map {
+        .init(id: makeToolCallID(), type: "function", function: .init(name: $0.name, arguments: $0.arguments))
+    }
+    return ChatCompletionResponse(
+        id: id,
+        object: "chat.completion",
+        created: created,
+        model: model,
+        choices: [.init(
+            index: 0,
+            message: .init(role: "assistant", content: outcome.content, tool_calls: toolCalls),
+            finish_reason: outcome.finishReason
+        )],
+        // FoundationModels does not expose token counts; report zeros so clients that
+        // require the `usage` field don't fail to decode the response.
+        usage: .init(prompt_tokens: 0, completion_tokens: 0, total_tokens: 0)
+    )
+}
+
 // MARK: - Streaming (pure helpers)
 
 /// Turns FoundationModels' cumulative snapshots into OpenAI-style incremental deltas.
@@ -632,6 +790,16 @@ extension AsyncBodyStreamWriter {
 
     func writeSSEDone() async throws {
         try await writeBuffer(ByteBuffer(string: sseDone))
+    }
+
+    /// Writes an outcome's content and tool calls as chunks (not the finish chunk).
+    func writeOutcomeTail(_ outcome: CompletionOutcome, chunks: ChunkFactory) async throws {
+        if let content = outcome.content, !content.isEmpty {
+            try await writeSSE(chunks.content(content))
+        }
+        if !outcome.toolCalls.isEmpty {
+            try await writeSSE(chunks.toolCalls(outcome.toolCalls))
+        }
     }
 }
 
@@ -905,6 +1073,82 @@ func buildTranscript(
 
 // MARK: - Streaming (FoundationModels bridge)
 
+// MARK: - Generation (FoundationModels bridge)
+
+/// A ready-to-run session for one request, plus what's needed to interpret its result.
+@available(macOS 26.0, *)
+struct CompletionSession {
+    let session: LanguageModelSession
+    let schema: GenerationSchema?
+    let recorder: ToolInvocationRecorder
+}
+
+/// Builds the schema, tools and transcript, then opens the session. Throws `Abort(400)` on
+/// unsupported schemas or malformed tool-call arguments. It runs before any generation, so
+/// those failures never get mistaken for model errors.
+@available(macOS 26.0, *)
+func makeCompletionSession(_ prepared: PreparedCompletion) throws -> CompletionSession {
+    let schema = try prepared.schemaSpec.map(buildGenerationSchema(from:))
+    let recorder = ToolInvocationRecorder()
+    let session: LanguageModelSession
+    if let conversation = prepared.conversation {
+        let replay = ToolReplayCache(conversation.pendingResults)
+        let tools = try buildProxyTools(prepared.activeTools, replay: replay, recorder: recorder)
+        let transcript = try buildTranscript(
+            instructions: prepared.instructions,
+            tools: tools,
+            history: conversation.history
+        )
+        session = LanguageModelSession(tools: tools, transcript: transcript)
+    } else if let instructions = prepared.instructions {
+        session = LanguageModelSession(instructions: instructions)
+    } else {
+        session = LanguageModelSession()
+    }
+    return CompletionSession(session: session, schema: schema, recorder: recorder)
+}
+
+/// Maps a generation error to an OpenAI `finish_reason`. Safety blocks become the standard
+/// `content_filter`. Everything else stays `error`, which is non-standard but keeps the
+/// existing 200-with-explanation contract; see `docs/ARCHITECTURE.md`.
+@available(macOS 26.0, *)
+func finishReason(for error: Error) -> String {
+    if let generationError = error as? LanguageModelSession.GenerationError {
+        switch generationError {
+        case .guardrailViolation, .refusal:
+            return "content_filter"
+        default:
+            return "error"
+        }
+    }
+    return "error"
+}
+
+/// Turns a failed generation into an outcome. A recorded invocation means `ProxyTool`
+/// aborted generation on purpose; the error arrives wrapped in `ToolCallError`, but the
+/// recorder is the source of truth for what was asked.
+@available(macOS 26.0, *)
+func failureOutcome(_ error: Error, recorder: ToolInvocationRecorder, logger: Logger) -> CompletionOutcome {
+    let invocations = recorder.invocations
+    if !invocations.isEmpty {
+        return .init(content: nil, toolCalls: invocations, finishReason: "tool_calls")
+    }
+    logger.error("FoundationModels Error: \(error)")
+    return .text("Error during generation: \(error.localizedDescription)", finishReason: finishReason(for: error))
+}
+
+@available(macOS 26.0, *)
+func generateCompletion(_ cs: CompletionSession, prompt: String, logger: Logger) async -> CompletionOutcome {
+    do {
+        if let schema = cs.schema {
+            return .text(try await cs.session.respond(to: prompt, schema: schema).content.jsonString)
+        }
+        return .text(try await cs.session.respond(to: prompt).content)
+    } catch {
+        return failureOutcome(error, recorder: cs.recorder, logger: logger)
+    }
+}
+
 /// Wraps a failed SSE write (client went away) so the streaming `catch` doesn't mistake it
 /// for a generation error and try to write an error chunk to a dead connection.
 struct StreamWriteFailed: Error {
@@ -913,10 +1157,8 @@ struct StreamWriteFailed: Error {
 
 @available(macOS 26.0, *)
 func makeStreamingCompletion(
-    session: LanguageModelSession,
+    _ cs: CompletionSession,
     prompt: String,
-    schema: GenerationSchema?,
-    recorder: ToolInvocationRecorder,
     chunks: ChunkFactory,
     includeUsage: Bool,
     logger: Logger
@@ -931,15 +1173,15 @@ func makeStreamingCompletion(
         }
 
         do {
-            if let schema {
+            if let schema = cs.schema {
                 // Partial `GeneratedContent` snapshots re-serialize with closing braces in
                 // different places, so they aren't prefix-stable JSON. Structured output is
                 // generated in full and sent as a single content chunk.
-                let response = try await session.respond(to: prompt, schema: schema)
+                let response = try await cs.session.respond(to: prompt, schema: schema)
                 try await send(chunks.content(response.content.jsonString))
             } else {
                 var previous = ""
-                for try await snapshot in session.streamResponse(to: prompt) {
+                for try await snapshot in cs.session.streamResponse(to: prompt) {
                     let delta = streamDelta(previous: previous, current: snapshot.content)
                     previous = snapshot.content
                     if !delta.isEmpty {
@@ -954,16 +1196,10 @@ func makeStreamingCompletion(
             logger.debug("Streaming client disconnected: \(failure.underlying)")
             throw failure.underlying
         } catch {
-            // Same contract as the non-streaming path: a recorded invocation means
-            // `ProxyTool` aborted generation on purpose. Text streamed before it stays sent.
-            let invocations = recorder.invocations
-            if !invocations.isEmpty {
-                try await writer.writeSSE(chunks.toolCalls(invocations))
-                return "tool_calls"
-            }
-            logger.error("FoundationModels Error: \(error)")
-            try await writer.writeSSE(chunks.content("Error during generation: \(error.localizedDescription)"))
-            return "error"
+            // Text streamed before a tool call or failure stays sent.
+            let outcome = failureOutcome(error, recorder: cs.recorder, logger: logger)
+            try await writer.writeOutcomeTail(outcome, chunks: chunks)
+            return outcome.finishReason
         }
     }
 }
@@ -1024,164 +1260,47 @@ struct FoundationModelsProxy {
 
         app.post("v1", "chat", "completions") { req async throws -> Response in
             let payload = try req.content.decode(ChatCompletionRequest.self)
-
-            let format = payload.response_format
-            let formatType = format?.type ?? "text"
-            let allowedFormats = Set(["text", "json_object", "json_schema"])
-            guard allowedFormats.contains(formatType) else {
-                throw Abort(.badRequest, reason: "Unsupported response_format.type: '\(formatType)'")
-            }
-            if formatType == "json_schema", format?.json_schema == nil {
-                throw Abort(.badRequest, reason: "response_format.type='json_schema' requires response_format.json_schema")
-            }
-
-            let baseInstructions = systemInstructions(from: payload.messages)
-            var effectiveInstructions: String? = (formatType == "json_object")
-                ? augmentInstructionsForJSONObject(baseInstructions)
-                : baseInstructions
-
-            // Tools: validated up front so bad definitions are 400s, not generation errors.
-            let requestedTools = payload.tools ?? []
-            let toolChoice = try parseToolChoice(payload.tool_choice)
-            let activeTools = try selectTools(requestedTools, choice: toolChoice)
-            let conversation: ToolConversation? = needsToolPipeline(tools: requestedTools, messages: payload.messages)
-                ? try splitToolConversation(payload.messages)
-                : nil
-
-            if !activeTools.isEmpty, let directive = toolChoiceDirective(toolChoice) {
-                effectiveInstructions = [effectiveInstructions, directive]
-                    .compactMap { $0 }
-                    .joined(separator: "\n\n")
-            }
-
-            let prompt: String
-            if let conversation {
-                // Results for tools that aren't attached this turn can't be replayed via
-                // `ProxyTool`; hand them to the model as text instead.
-                let activeNames = Set(activeTools.map(\.function.name))
-                let unreplayable = conversation.pendingResults.filter { !activeNames.contains($0.name) }
-                prompt = appendToolResultsToPrompt(conversation.prompt, results: unreplayable)
-            } else {
-                prompt = renderPrompt(from: payload.messages)
-            }
+            let prepared = try prepareCompletion(payload)
 
             let completionID = "chatcmpl-\(UUID().uuidString)"
             let created = Int(Date().timeIntervalSince1970)
-            let modelName = payload.model ?? "apple-foundation-model"
-            let wantsStream = payload.stream == true
-            let chunks = ChunkFactory(id: completionID, created: created, model: modelName)
-            let includeUsage = payload.stream_options?.include_usage == true
+            let chunks = ChunkFactory(id: completionID, created: created, model: prepared.model)
 
-            var generatedText: String? = "FoundationModels framework is not available or not supported on this OS version."
-            var toolCalls: [ChatCompletionRequest.ToolCall]? = nil
-            var finishReason = "stop"
-
+            let outcome: CompletionOutcome
             #if canImport(FoundationModels)
             if #available(macOS 26.0, *) {
-                // Build the schema before opening the session so input-validation errors
-                // surface as 400s instead of being swallowed by the session-error catch.
-                let schema: GenerationSchema?
-                if formatType == "json_schema", let spec = format?.json_schema {
-                    schema = try buildGenerationSchema(from: spec)
-                } else {
-                    schema = nil
-                }
-
-                let recorder = ToolInvocationRecorder()
-                let session: LanguageModelSession
-                if let conversation {
-                    let replay = ToolReplayCache(conversation.pendingResults)
-                    let tools = try buildProxyTools(activeTools, replay: replay, recorder: recorder)
-                    let transcript = try buildTranscript(
-                        instructions: effectiveInstructions,
-                        tools: tools,
-                        history: conversation.history
-                    )
-                    session = LanguageModelSession(tools: tools, transcript: transcript)
-                } else if let effectiveInstructions {
-                    session = LanguageModelSession(instructions: effectiveInstructions)
-                } else {
-                    session = LanguageModelSession()
-                }
-
-                if wantsStream {
+                let cs = try makeCompletionSession(prepared)
+                if prepared.stream {
                     return makeStreamingCompletion(
-                        session: session,
-                        prompt: prompt,
-                        schema: schema,
-                        recorder: recorder,
+                        cs,
+                        prompt: prepared.prompt,
                         chunks: chunks,
-                        includeUsage: includeUsage,
+                        includeUsage: prepared.includeUsage,
                         logger: app.logger
                     )
                 }
-
-                do {
-                    if let schema {
-                        let response = try await session.respond(to: prompt, schema: schema)
-                        generatedText = response.content.jsonString
-                    } else {
-                        let response = try await session.respond(to: prompt)
-                        generatedText = response.content
-                    }
-                } catch {
-                    // `ProxyTool` aborts generation by throwing; the error arrives wrapped in
-                    // `ToolCallError`. The recorder is the source of truth for what was asked.
-                    let invocations = recorder.invocations
-                    if !invocations.isEmpty {
-                        toolCalls = invocations.map {
-                            .init(id: makeToolCallID(), type: "function", function: .init(name: $0.name, arguments: $0.arguments))
-                        }
-                        generatedText = nil
-                        finishReason = "tool_calls"
-                    } else {
-                        app.logger.error("FoundationModels Error: \(error)")
-                        generatedText = "Error during generation: \(error.localizedDescription)"
-                        finishReason = "error"
-                    }
-                }
+                outcome = await generateCompletion(cs, prompt: prepared.prompt, logger: app.logger)
+            } else {
+                outcome = unavailableCompletionOutcome
             }
             #else
-            // Fallback mock when building on toolchains without FoundationModels.
             app.logger.warning("Mocking response since FoundationModels cannot be imported.")
-            if formatType == "json_object" || formatType == "json_schema" {
-                generatedText = "{\"mock\":true}"
-            } else {
-                generatedText = "[Mock Apple Intelligence Response] \(prompt)"
-            }
+            outcome = mockCompletionOutcome(prepared)
             #endif
 
-            if wantsStream {
+            if prepared.stream {
                 // Reached on the mock build and on pre-macOS-26 runtimes: stream the fixed
-                // text as a single chunk so streaming clients still get a well-formed reply.
-                let text = generatedText ?? ""
-                return makeSSEResponse(chunks: chunks, includeUsage: includeUsage) { writer in
-                    try await writer.writeSSE(chunks.content(text))
-                    return "stop"
+                // outcome so streaming clients still get a well-formed reply.
+                return makeSSEResponse(chunks: chunks, includeUsage: prepared.includeUsage) { writer in
+                    try await writer.writeOutcomeTail(outcome, chunks: chunks)
+                    return outcome.finishReason
                 }
             }
-
-            let choice = ChatCompletionResponse.Choice(
-                index: 0,
-                message: .init(role: "assistant", content: generatedText, tool_calls: toolCalls),
-                finish_reason: finishReason
-            )
-
-            // FoundationModels does not expose token counts; report zeros so clients that
-            // require the `usage` field don't fail to decode the response.
-            let usage = ChatCompletionResponse.Usage(
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0
-            )
-
-            return try await ChatCompletionResponse(
+            return try await makeCompletionResponse(
+                outcome,
                 id: completionID,
-                object: "chat.completion",
                 created: created,
-                model: modelName,
-                choices: [choice],
-                usage: usage
+                model: prepared.model
             ).encodeResponse(for: req)
         }
 

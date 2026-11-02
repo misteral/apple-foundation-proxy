@@ -19,12 +19,22 @@ Two endpoints, both on `127.0.0.1:8080`:
 | `GET`  | `/health` | Reports `FoundationModels` import status, runtime availability, and which locales `SystemLanguageModel.default` supports on the host. |
 | `POST` | `/v1/chat/completions` | OpenAI-shaped request/response envelope. Generates text from `messages` via `LanguageModelSession`. Supports `response_format` and `tools` / `tool_choice`. |
 
-The OpenAI compatibility covers text generation, structured output (`response_format`), and client-executed tool calls (`tools` / `tool_choice`). Streaming (`stream: true`) is supported for all of the above. Missing on purpose for now: `n > 1`, `logprobs`, multimodal content. `usage` is returned with zero counts because `FoundationModels` does not expose token usage.
+The OpenAI compatibility covers text generation, structured output (`response_format`), and client-executed tool calls (`tools` / `tool_choice`). Streaming (`stream: true`) is supported for all of the above. Missing on purpose for now: `n > 1`, `logprobs`, non-text content parts. `usage` is returned with zero counts because `FoundationModels` does not expose token usage.
 
 ## Request pipeline for `/v1/chat/completions`
 
 The request body limit is raised to 4 MB (`app.routes.defaultMaxBodySize`). Vapor's 16 KB default returns `413` for ordinary agent traffic with tool schemas and tool results.
 
+The route closure is a thin shell over top-level functions:
+
+- **`prepareCompletion(_:)`** is pure and does all request validation, so every `400` is decided there and unit-tested. It produces a `PreparedCompletion`: instructions, prompt, active tools, tool conversation, stream flags, model name.
+- **`makeCompletionSession(_:)`** (gated) builds the schema, tools and transcript and opens the session. It can still `400` on an unsupported schema or malformed tool-call arguments, always before generation starts.
+- **`generateCompletion`** or **`makeStreamingCompletion`** (gated) runs the model and produces a `CompletionOutcome`: content, tool calls, finish reason.
+- **`makeCompletionResponse`** (pure) builds the JSON response; streaming writes the same outcome as chunks.
+
+Message `content` may be a string, `null`, or an array of parts. Text parts are joined with `\n`; any other part type (images, audio) is a `400`.
+
+Steps inside `prepareCompletion` and `makeCompletionSession`:
 
 1. **Validate `response_format.type`** (one of `text` / `json_object` / `json_schema`); reject unknown values with `400`. For `json_schema`, require a `json_schema` payload.
 2. **`systemInstructions`** — joins all `system` and `developer` role messages into one instructions block (newline-separated). Returns nil when the request has none.
@@ -33,8 +43,9 @@ The request body limit is raised to 4 MB (`app.routes.defaultMaxBodySize`). Vapo
 5. **`buildGenerationSchema`** (only when `type == "json_schema"`) — translates the JSON Schema fragment into a `DynamicGenerationSchema` and wraps it in a `GenerationSchema`. Schema construction errors surface as `400` (run before opening the session so they don't get swallowed by the generic catch).
 6. **`LanguageModelSession`** — a fresh session is created **per request**. Constructed with `instructions:` when those exist, otherwise with no instructions. No conversation state across requests.
 7. **Generate.** When a schema is present, call `respond(to:schema:)` and return `response.content.jsonString` as `choices[0].message.content`. Otherwise call `respond(to:)` and return the text response.
-
 8. **Stream** (only when `stream: true`) — instead of step 7, return an SSE response; see below.
+
+Generation errors are returned as `200` with an `Error during generation: ...` message, mapped by `finishReason(for:)`: `guardrailViolation` and `refusal` become the standard `content_filter`, and everything else becomes `error`. `error` isn't an OpenAI value; see the tech-debt tracker.
 
 Without `tools`, history is prompt-stuffed (step 4). With `tools`, the pipeline switches to a native `Transcript` — see below.
 
@@ -58,7 +69,7 @@ The non-streaming path stays the default; streaming is opt-in per request. The r
 
 1. A role chunk: `delta: {role: "assistant", content: ""}`.
 2. Content chunks from `session.streamResponse(to:)`. FoundationModels yields **cumulative snapshots**, not deltas; `streamDelta(previous:current:)` turns them into the incremental `delta.content` OpenAI clients expect. If a snapshot ever stops extending the previous one, the text after the common prefix is sent (SSE can't take back text).
-3. A finish chunk with an empty `delta` and `finish_reason` (`stop`, `tool_calls`, or `error`). Non-final chunks carry `finish_reason: null` explicitly.
+3. A finish chunk with an empty `delta` and `finish_reason` (`stop`, `tool_calls`, `content_filter`, or `error`). Non-final chunks carry `finish_reason: null` explicitly.
 4. With `stream_options.include_usage: true`, a usage chunk (`choices: []`, zeros).
 5. `data: [DONE]`.
 
@@ -66,7 +77,7 @@ Tools: `streamResponse` invokes `Tool.call` mid-stream (verified on device), so 
 
 `json_schema` with `stream: true` is generated in full and sent as a single content chunk. Partial `GeneratedContent` snapshots re-serialize with the closing braces in different places, so they don't form a prefix-stable JSON text stream.
 
-A failed SSE write (client disconnected) is told apart from a generation error (`StreamWriteFailed`). It ends the stream quietly, without an error chunk or error log. Errors mid-stream mirror the non-streaming path: an `Error during generation: ...` content chunk plus `finish_reason: "error"`. HTTP status is already `200` by then.
+A failed SSE write (client disconnected) is told apart from a generation error (`StreamWriteFailed`). It ends the stream quietly, without an error chunk or error log. Errors mid-stream mirror the non-streaming path: an `Error during generation: ...` content chunk plus `finish_reason` from `finishReason(for:)`. HTTP status is already `200` by then.
 
 ## Supported JSON Schema subset (for `response_format.json_schema`)
 

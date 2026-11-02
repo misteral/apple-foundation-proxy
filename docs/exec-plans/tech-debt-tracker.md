@@ -36,6 +36,24 @@ Priority: `P0` blocks correctness, `P1` blocks a real use case, `P2` is hygiene.
 **Why it matters:** a schema that builds cleanly may still produce malformed output when the model generates against it (e.g., if a property name collides with framework reserved words, or `anyOf` enum values aren't quoted as expected). Without an integration test, regressions are caught only by hand-running `curl`.
 **Fix sketch:** add a separate integration target (gated, opt-in) that runs against Apple Intelligence on a developer machine and asserts the JSON output parses against a known schema. Skip in CI.
 
+### [P2] `finish_reason: "error"` is not an OpenAI value
+**Where:** `Sources/apple-foundation-proxy/main.swift` — `finishReason(for:)`, `failureOutcome`
+**What:** generation failures other than safety blocks return `200` with an explanatory message and `finish_reason: "error"`. Safety blocks already map to the standard `content_filter`.
+**Why it matters:** strict clients may reject the unknown value, and others treat the error text as a real answer.
+**Fix sketch:** for non-streaming requests, return a real HTTP error (`500`, or `429` for `rateLimited` / `concurrentRequests`) with an OpenAI-style `error` object. Streaming can't change status after the first byte, so keep a message chunk there. This changes the client-visible contract, so it needs a decision first.
+
+### [P2] Tool requests require a `user` message; plain requests don't
+**Where:** `splitToolConversation`
+**What:** with tools (or tool history), a request without any `user` message is a `400`. Without tools, the same request is accepted and the model gets an empty prompt.
+**Why it matters:** an inconsistent contract, but both inputs are meaningless, so no real client is affected.
+**Fix sketch:** reject a missing `user` message in `prepareCompletion` for all requests, once we're sure no client depends on the lenient path.
+
+### [P2] Replayed tool results are lost if the model doesn't call the tool again
+**Where:** `ToolReplayCache` / `ProxyTool` replay
+**What:** pending tool results reach the model only when it calls the same tool again during regeneration. If it answers directly instead, the results are unused and nothing signals it.
+**Why it matters:** never observed in on-device tests; the model called the tool again every time. A wrong answer would be silent, though.
+**Fix sketch:** track which pending results were served. If generation finishes with some unserved, regenerate once with them appended as text (`appendToolResultsToPrompt`). Only worth doing if it's seen in practice.
+
 ---
 
 ## Resolved

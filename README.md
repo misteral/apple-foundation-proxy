@@ -121,6 +121,10 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
   -d '{"stream":true,"messages":[{"role":"user","content":"Count from 1 to 10 in words."}]}'
 ```
 
-Not implemented yet: `n > 1`, `logprobs`, multimodal content. `usage` token counts are reported as zeros because `FoundationModels` does not surface them.
+Message `content` can be a string or an array of `{"type":"text"}` parts, which are joined with newlines. Images and other non-text parts are rejected with `400`.
+
+If generation fails, the response is still `200`, with an explanatory message. The `finish_reason` is `content_filter` when the model's safety guardrails blocked the request, and `error` otherwise.
+
+Not implemented yet: `n > 1`, `logprobs`, non-text content parts. `usage` token counts are reported as zeros because `FoundationModels` does not surface them.
 
 Note: Apple Foundation Models currently reports `ru_RU` as unsupported on the tested machine, so Russian output may be unreliable even though the endpoint works.

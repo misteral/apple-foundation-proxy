@@ -694,6 +694,137 @@ import FoundationModels
     }
 }
 
+// MARK: - Message content forms
+
+@Suite struct MessageContentDecodingTests {
+    private func message(_ json: String) throws -> ChatCompletionRequest.Message {
+        try JSONDecoder().decode(ChatCompletionRequest.Message.self, from: Data(json.utf8))
+    }
+
+    @Test func acceptsStringNullAndMissingContent() throws {
+        #expect(try message(#"{"role":"user","content":"hi"}"#).content == "hi")
+        #expect(try message(#"{"role":"assistant","content":null}"#).content == nil)
+        #expect(try message(#"{"role":"assistant"}"#).content == nil)
+    }
+
+    @Test func joinsTextPartsWithNewlines() throws {
+        let m = try message(#"{"role":"tool","tool_call_id":"c1","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}"#)
+        #expect(m.content == "a\nb")
+        #expect(m.tool_call_id == "c1")
+    }
+
+    @Test func rejectsNonTextParts() {
+        #expect(throws: DecodingError.self) {
+            try message(#"{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}"#)
+        }
+        #expect(throws: DecodingError.self) {
+            try message(#"{"role":"user","content":42}"#)
+        }
+    }
+}
+
+// MARK: - Request preparation (all 400s are decided here)
+
+@Suite struct PrepareCompletionTests {
+    private func prepare(_ json: String) throws -> PreparedCompletion {
+        try prepareCompletion(JSONDecoder().decode(ChatCompletionRequest.self, from: Data(json.utf8)))
+    }
+
+    private let weatherTool = #"{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}"#
+
+    @Test func plainRequestDefaults() throws {
+        let p = try prepare(#"{"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}"#)
+        #expect(p.formatType == "text")
+        #expect(p.instructions == "be brief")
+        #expect(p.prompt == "hi")
+        #expect(p.conversation == nil)
+        #expect(p.activeTools.isEmpty)
+        #expect(!p.stream && !p.includeUsage)
+        #expect(p.model == "apple-foundation-model")
+        #expect(p.schemaSpec == nil)
+    }
+
+    @Test func streamFlagsAndModelPassThrough() throws {
+        let p = try prepare(#"{"model":"x","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}"#)
+        #expect(p.stream && p.includeUsage)
+        #expect(p.model == "x")
+    }
+
+    @Test func responseFormatValidation() throws {
+        #expect(throws: Abort.self) {
+            try prepare(#"{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"xml"}}"#)
+        }
+        #expect(throws: Abort.self) {
+            try prepare(#"{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_schema"}}"#)
+        }
+        let obj = try prepare(#"{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_object"}}"#)
+        #expect(obj.instructions == jsonObjectDirective)
+        let schema = try prepare(#"{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"S","schema":{"type":"string"}}}}"#)
+        #expect(schema.schemaSpec?.name == "S")
+    }
+
+    @Test func toolRequestUsesToolPipelineWithDirective() throws {
+        let p = try prepare(#"{"messages":[{"role":"user","content":"weather?"}],"tools":[\#(weatherTool)],"tool_choice":"required"}"#)
+        #expect(p.conversation != nil)
+        #expect(p.activeTools.map(\.function.name) == ["get_weather"])
+        #expect(p.instructions == toolChoiceDirective(.required))
+    }
+
+    @Test func toolHistoryWithoutToolsFallsBackToTextResults() throws {
+        let p = try prepare(#"""
+        {"messages":[
+          {"role":"user","content":"weather?"},
+          {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},
+          {"role":"tool","tool_call_id":"c1","content":"Sunny"}
+        ]}
+        """#)
+        #expect(p.conversation?.pendingResults.count == 1)
+        #expect(p.prompt == "weather?\n\nTool results:\n- get_weather({}): Sunny")
+    }
+
+    @Test func toolValidationErrors() {
+        #expect(throws: Abort.self) {
+            try prepare(#"{"messages":[{"role":"user","content":"hi"}],"tool_choice":"required"}"#)
+        }
+        #expect(throws: Abort.self) {
+            try prepare(#"{"messages":[{"role":"user","content":"hi"}],"tools":[\#(weatherTool),\#(weatherTool)]}"#)
+        }
+        #expect(throws: Abort.self) {
+            try prepare(#"{"messages":[{"role":"system","content":"s"}],"tools":[\#(weatherTool)]}"#)
+        }
+    }
+}
+
+// MARK: - Outcome → response
+
+@Suite struct CompletionResponseTests {
+    @Test func textOutcome() {
+        let r = makeCompletionResponse(.text("hi"), id: "id", created: 1, model: "m")
+        #expect(r.object == "chat.completion")
+        #expect(r.choices.first?.message.content == "hi")
+        #expect(r.choices.first?.message.tool_calls == nil)
+        #expect(r.choices.first?.finish_reason == "stop")
+    }
+
+    @Test func toolCallOutcome() {
+        let outcome = CompletionOutcome(content: nil, toolCalls: [.init(name: "f", arguments: "{}")], finishReason: "tool_calls")
+        let r = makeCompletionResponse(outcome, id: "id", created: 1, model: "m")
+        let calls = r.choices.first?.message.tool_calls ?? []
+        #expect(r.choices.first?.message.content == nil)
+        #expect(calls.map(\.function.name) == ["f"])
+        #expect(calls.first?.id.hasPrefix("call_") == true)
+        #expect(r.choices.first?.finish_reason == "tool_calls")
+    }
+
+    @Test func mockOutcomeDependsOnFormat() throws {
+        let p = try prepareCompletion(JSONDecoder().decode(
+            ChatCompletionRequest.self,
+            from: Data(#"{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_object"}}"#.utf8)
+        ))
+        #expect(mockCompletionOutcome(p) == .text("{\"mock\":true}"))
+    }
+}
+
 #if canImport(FoundationModels)
 
 @Suite struct ToolBridgeTests {
@@ -776,6 +907,26 @@ import FoundationModels
             }
         }
         #expect(kinds == ["instructions(1)", "prompt", "toolCalls(1)", "toolOutput(get_weather)", "response"])
+    }
+
+    @Test func safetyErrorsMapToContentFilter() throws {
+        guard #available(macOS 26.0, *) else { return }
+        typealias GE = LanguageModelSession.GenerationError
+        let ctx = GE.Context(debugDescription: "t")
+        #expect(finishReason(for: GE.guardrailViolation(ctx)) == "content_filter")
+        #expect(finishReason(for: GE.exceededContextWindowSize(ctx)) == "error")
+        #expect(finishReason(for: Abort(.internalServerError)) == "error")
+    }
+
+    @Test func failureOutcomePrefersRecordedToolCalls() throws {
+        guard #available(macOS 26.0, *) else { return }
+        let recorder = ToolInvocationRecorder()
+        let logger = Logger(label: "test")
+        let ctx = LanguageModelSession.GenerationError.Context(debugDescription: "t")
+        #expect(failureOutcome(LanguageModelSession.GenerationError.guardrailViolation(ctx), recorder: recorder, logger: logger).finishReason == "content_filter")
+        recorder.record(name: "f", arguments: "{}")
+        let outcome = failureOutcome(ProxyToolInvocation(name: "f", arguments: "{}"), recorder: recorder, logger: logger)
+        #expect(outcome == CompletionOutcome(content: nil, toolCalls: [.init(name: "f", arguments: "{}")], finishReason: "tool_calls"))
     }
 
     @Test func transcriptRejectsInvalidToolCallArguments() throws {

@@ -24,6 +24,9 @@ The pure helpers in `main.swift` are the high-leverage targets — they are dete
 - `JSONValue` decoding — primitives, arrays, objects, round-trip through `JSONEncoder`/`JSONDecoder`, accessor helpers.
 - `ChatCompletionRequest` decoding — verify `response_format` and nested `json_schema` decode from the OpenAI wire format; `tools`, `tool_choice`, `tool_calls`, `tool_call_id`, null `content`.
 - Tool helpers — `parseToolChoice`, `toolChoiceDirective`, `selectTools`, `splitToolConversation`, `appendToolResultsToPrompt`, `ToolReplayCache`, `ToolInvocationRecorder`. `buildProxyTools`, `ProxyTool.call`, and `buildTranscript` are FoundationModels-gated like the schema bridge.
+- `prepareCompletion` — the single place request validation lives, so this is where the `400`-vs-`200` contract is tested (formats, tool definitions, `tool_choice`, tool pipeline selection, prompt with text-fallback tool results).
+- `Message` content decoding — string / `null` / missing / text-part arrays; non-text parts rejected.
+- `makeCompletionResponse`, `mockCompletionOutcome`; gated: `finishReason(for:)` (`content_filter` mapping), `failureOutcome`.
 - Streaming helpers — `streamDelta` (prefix, divergence, multi-byte), `sseEvent` framing, `ChunkFactory` chunk shapes (explicit `finish_reason: null`, omitted unset delta fields, indexed tool calls, usage trailer).
 
 The `buildGenerationSchema(from:)` bridge requires `FoundationModels` types, so its tests are gated behind `#if canImport(FoundationModels)` and skip at runtime via `#available(macOS 26.0, *)` on older OSes. Cover both happy paths (object/array/enum/scalar) and the rejection cases (`oneOf`/`anyOf`/`allOf`/`$ref`/`pattern`/`format`/`additionalProperties`, missing `items`, unknown `type`, non-object fragment, missing `schema`).
