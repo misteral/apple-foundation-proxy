@@ -24,6 +24,7 @@ The pure helpers in `main.swift` are the high-leverage targets — they are dete
 - `JSONValue` decoding — primitives, arrays, objects, round-trip through `JSONEncoder`/`JSONDecoder`, accessor helpers.
 - `ChatCompletionRequest` decoding — verify `response_format` and nested `json_schema` decode from the OpenAI wire format; `tools`, `tool_choice`, `tool_calls`, `tool_call_id`, null `content`.
 - Tool helpers — `parseToolChoice`, `toolChoiceDirective`, `selectTools`, `splitToolConversation`, `appendToolResultsToPrompt`, `ToolReplayCache`, `ToolInvocationRecorder`. `buildProxyTools`, `ProxyTool.call`, and `buildTranscript` are FoundationModels-gated like the schema bridge.
+- Streaming helpers — `streamDelta` (prefix, divergence, multi-byte), `sseEvent` framing, `ChunkFactory` chunk shapes (explicit `finish_reason: null`, omitted unset delta fields, indexed tool calls, usage trailer).
 
 The `buildGenerationSchema(from:)` bridge requires `FoundationModels` types, so its tests are gated behind `#if canImport(FoundationModels)` and skip at runtime via `#available(macOS 26.0, *)` on older OSes. Cover both happy paths (object/array/enum/scalar) and the rejection cases (`oneOf`/`anyOf`/`allOf`/`$ref`/`pattern`/`format`/`additionalProperties`, missing `items`, unknown `type`, non-object fragment, missing `schema`).
 
@@ -47,3 +48,4 @@ Confirm that:
 - The chat response is a sensible answer that respects the `system` message (try with and without a `system` message).
 - Multi-turn requests (a `user`/`assistant`/`user` sequence) produce output that reflects the prior turns.
 - A request with `tools` that needs a tool returns `finish_reason: "tool_calls"`; posting the `assistant` `tool_calls` + `tool` result back yields a final answer using the result. See the tools example in `README.md`.
+- `curl -N` with `"stream": true` prints several `data:` chunks arriving over time, ending in a `finish_reason` chunk and `data: [DONE]`. Repeat with `tools` and check that the stream ends in a `tool_calls` delta.

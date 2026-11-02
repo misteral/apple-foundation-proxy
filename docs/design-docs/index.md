@@ -5,7 +5,7 @@ Catalogue of design decisions. Add new docs here when changing a load-bearing in
 | Doc | Summary |
 |-----|---------|
 | [core-beliefs.md](core-beliefs.md) | Operating principles for this project: scope, honesty about limits, dual-mode build. |
-| [openai-compatible-chat.md](openai-compatible-chat.md) | Forward-looking architecture for `/v1/chat/completions` covering streaming, tool calls, and structured output. The basic text-generation shape is already implemented in `main.swift`; this doc covers what's still missing. |
+| [openai-compatible-chat.md](openai-compatible-chat.md) | Design rationale for `/v1/chat/completions`: structured output, tool calls, and streaming (all implemented), plus spike outcomes. |
 
 ## When to add a design doc
 

@@ -141,6 +141,12 @@ struct ChatCompletionRequest: Content {
     let tools: [ToolDefinition]?
     /// `"auto"`, `"none"`, `"required"`, or `{"type":"function","function":{"name":...}}`.
     let tool_choice: JSONValue?
+
+    struct StreamOptions: Content {
+        let include_usage: Bool?
+    }
+    let stream: Bool?
+    let stream_options: StreamOptions?
 }
 
 struct ChatCompletionResponse: Content {
@@ -198,6 +204,45 @@ struct HealthResponse: Content {
         let toolCalls: Bool
         let structuredOutput: Bool
     }
+}
+
+// MARK: - Streaming DTOs (`stream: true`)
+
+/// One `chat.completion.chunk` SSE payload.
+struct ChatCompletionChunk: Content {
+    struct ToolCallDelta: Content, Equatable {
+        let index: Int
+        let id: String
+        let type: String
+        let function: ChatCompletionRequest.ToolCall.Function
+    }
+
+    struct Delta: Content, Equatable {
+        var role: String? = nil
+        var content: String? = nil
+        var tool_calls: [ToolCallDelta]? = nil
+    }
+
+    struct Choice: Content {
+        let index: Int
+        let delta: Delta
+        let finish_reason: String?
+
+        // OpenAI emits `"finish_reason": null` on every non-final chunk; keep the key.
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(index, forKey: .index)
+            try c.encode(delta, forKey: .delta)
+            try c.encode(finish_reason, forKey: .finish_reason)
+        }
+    }
+
+    let id: String
+    let object: String
+    let created: Int
+    let model: String
+    let choices: [Choice]
+    let usage: ChatCompletionResponse.Usage?
 }
 
 // MARK: - Prompt assembly
@@ -476,6 +521,104 @@ func makeToolCallID() -> String {
     "call_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24).lowercased()
 }
 
+// MARK: - Streaming (pure helpers)
+
+/// Turns FoundationModels' cumulative snapshots into OpenAI-style incremental deltas.
+///
+/// `streamResponse` yields the *whole* text generated so far on every element, not the new
+/// piece. Normally each snapshot extends the previous one; if it ever doesn't, SSE has no way
+/// to retract already-sent text, so we emit what follows the common prefix and accept the
+/// divergence rather than duplicating output.
+func streamDelta(previous: String, current: String) -> String {
+    if current.hasPrefix(previous) {
+        return String(current.dropFirst(previous.count))
+    }
+    let common = current.commonPrefix(with: previous)
+    return String(current.dropFirst(common.count))
+}
+
+let sseDone = "data: [DONE]\n\n"
+
+func sseEvent<T: Encodable>(_ value: T) throws -> String {
+    let data = try JSONEncoder().encode(value)
+    return "data: " + String(decoding: data, as: UTF8.self) + "\n\n"
+}
+
+/// Builds the chunk sequence of one streamed completion. All chunks share `id`/`created`/
+/// `model`, as OpenAI clients expect.
+struct ChunkFactory {
+    let id: String
+    let created: Int
+    let model: String
+
+    private func chunk(_ delta: ChatCompletionChunk.Delta, finish: String? = nil) -> ChatCompletionChunk {
+        ChatCompletionChunk(
+            id: id,
+            object: "chat.completion.chunk",
+            created: created,
+            model: model,
+            choices: [.init(index: 0, delta: delta, finish_reason: finish)],
+            usage: nil
+        )
+    }
+
+    func role() -> ChatCompletionChunk { chunk(.init(role: "assistant", content: "")) }
+
+    func content(_ text: String) -> ChatCompletionChunk { chunk(.init(content: text)) }
+
+    func toolCalls(_ invocations: [ToolInvocationRecorder.Invocation]) -> ChatCompletionChunk {
+        chunk(.init(tool_calls: invocations.enumerated().map { i, inv in
+            .init(index: i, id: makeToolCallID(), type: "function", function: .init(name: inv.name, arguments: inv.arguments))
+        }))
+    }
+
+    func finish(_ reason: String) -> ChatCompletionChunk { chunk(.init(), finish: reason) }
+
+    /// `stream_options.include_usage` trailer: empty `choices`, zeroed usage (see `Usage`).
+    func usage() -> ChatCompletionChunk {
+        ChatCompletionChunk(
+            id: id,
+            object: "chat.completion.chunk",
+            created: created,
+            model: model,
+            choices: [],
+            usage: .init(prompt_tokens: 0, completion_tokens: 0, total_tokens: 0)
+        )
+    }
+}
+
+extension AsyncBodyStreamWriter {
+    func writeSSE(_ chunk: ChatCompletionChunk) async throws {
+        try await writeBuffer(ByteBuffer(string: try sseEvent(chunk)))
+    }
+
+    func writeSSEDone() async throws {
+        try await writeBuffer(ByteBuffer(string: sseDone))
+    }
+}
+
+/// Wraps a generator in an OpenAI-shaped SSE response: role chunk, whatever `generate`
+/// writes, a finish chunk with the reason it returns, an optional usage trailer, `[DONE]`.
+func makeSSEResponse(
+    chunks: ChunkFactory,
+    includeUsage: Bool,
+    generate: @escaping @Sendable (AsyncBodyStreamWriter) async throws -> String
+) -> Response {
+    let body = Response.Body(managedAsyncStream: { writer in
+        try await writer.writeSSE(chunks.role())
+        let finishReason = try await generate(writer)
+        try await writer.writeSSE(chunks.finish(finishReason))
+        if includeUsage {
+            try await writer.writeSSE(chunks.usage())
+        }
+        try await writer.writeSSEDone()
+    })
+    var headers = HTTPHeaders()
+    headers.contentType = HTTPMediaType(type: "text", subType: "event-stream")
+    headers.replaceOrAdd(name: .cacheControl, value: "no-cache")
+    return Response(status: .ok, headers: headers, body: body)
+}
+
 #if canImport(FoundationModels)
 
 /// Translates a (subset of) JSON Schema into a `GenerationSchema` consumable by
@@ -722,6 +865,52 @@ func buildTranscript(
     return Transcript(entries: entries)
 }
 
+// MARK: - Streaming (FoundationModels bridge)
+
+@available(macOS 26.0, *)
+func makeStreamingCompletion(
+    session: LanguageModelSession,
+    prompt: String,
+    schema: GenerationSchema?,
+    recorder: ToolInvocationRecorder,
+    chunks: ChunkFactory,
+    includeUsage: Bool,
+    logger: Logger
+) -> Response {
+    makeSSEResponse(chunks: chunks, includeUsage: includeUsage) { writer in
+        do {
+            if let schema {
+                // Partial `GeneratedContent` snapshots re-serialize with closing braces in
+                // different places, so they aren't prefix-stable JSON. Structured output is
+                // generated in full and sent as a single content chunk.
+                let response = try await session.respond(to: prompt, schema: schema)
+                try await writer.writeSSE(chunks.content(response.content.jsonString))
+            } else {
+                var previous = ""
+                for try await snapshot in session.streamResponse(to: prompt) {
+                    let delta = streamDelta(previous: previous, current: snapshot.content)
+                    previous = snapshot.content
+                    if !delta.isEmpty {
+                        try await writer.writeSSE(chunks.content(delta))
+                    }
+                }
+            }
+            return "stop"
+        } catch {
+            // Same contract as the non-streaming path: a recorded invocation means
+            // `ProxyTool` aborted generation on purpose. Text streamed before it stays sent.
+            let invocations = recorder.invocations
+            if !invocations.isEmpty {
+                try await writer.writeSSE(chunks.toolCalls(invocations))
+                return "tool_calls"
+            }
+            logger.error("FoundationModels Error: \(error)")
+            try await writer.writeSSE(chunks.content("Error during generation: \(error.localizedDescription)"))
+            return "error"
+        }
+    }
+}
+
 #endif
 
 // MARK: - Main Application
@@ -755,7 +944,7 @@ struct FoundationModelsProxy {
                     currentLocaleSupported: model.supportsLocale(),
                     enUSSupported: model.supportsLocale(Locale(identifier: "en_US")),
                     ruRUSupported: model.supportsLocale(Locale(identifier: "ru_RU")),
-                    capabilities: .init(streaming: false, toolCalls: true, structuredOutput: true)
+                    capabilities: .init(streaming: true, toolCalls: true, structuredOutput: true)
                 )
             }
             #endif
@@ -773,7 +962,7 @@ struct FoundationModelsProxy {
             )
         }
 
-        app.post("v1", "chat", "completions") { req async throws -> ChatCompletionResponse in
+        app.post("v1", "chat", "completions") { req async throws -> Response in
             let payload = try req.content.decode(ChatCompletionRequest.self)
 
             let format = payload.response_format
@@ -816,6 +1005,13 @@ struct FoundationModelsProxy {
                 prompt = renderPrompt(from: payload.messages)
             }
 
+            let completionID = "chatcmpl-\(UUID().uuidString)"
+            let created = Int(Date().timeIntervalSince1970)
+            let modelName = payload.model ?? "apple-foundation-model"
+            let wantsStream = payload.stream == true
+            let chunks = ChunkFactory(id: completionID, created: created, model: modelName)
+            let includeUsage = payload.stream_options?.include_usage == true
+
             var generatedText: String? = "FoundationModels framework is not available or not supported on this OS version."
             var toolCalls: [ChatCompletionRequest.ToolCall]? = nil
             var finishReason = "stop"
@@ -846,6 +1042,18 @@ struct FoundationModelsProxy {
                     session = LanguageModelSession(instructions: effectiveInstructions)
                 } else {
                     session = LanguageModelSession()
+                }
+
+                if wantsStream {
+                    return makeStreamingCompletion(
+                        session: session,
+                        prompt: prompt,
+                        schema: schema,
+                        recorder: recorder,
+                        chunks: chunks,
+                        includeUsage: includeUsage,
+                        logger: app.logger
+                    )
                 }
 
                 do {
@@ -883,6 +1091,16 @@ struct FoundationModelsProxy {
             }
             #endif
 
+            if wantsStream {
+                // Reached on the mock build and on pre-macOS-26 runtimes: stream the fixed
+                // text as a single chunk so streaming clients still get a well-formed reply.
+                let text = generatedText ?? ""
+                return makeSSEResponse(chunks: chunks, includeUsage: includeUsage) { writer in
+                    try await writer.writeSSE(chunks.content(text))
+                    return "stop"
+                }
+            }
+
             let choice = ChatCompletionResponse.Choice(
                 index: 0,
                 message: .init(role: "assistant", content: generatedText, tool_calls: toolCalls),
@@ -897,14 +1115,14 @@ struct FoundationModelsProxy {
                 total_tokens: 0
             )
 
-            return ChatCompletionResponse(
-                id: "chatcmpl-\(UUID().uuidString)",
+            return try await ChatCompletionResponse(
+                id: completionID,
                 object: "chat.completion",
-                created: Int(Date().timeIntervalSince1970),
-                model: payload.model ?? "apple-foundation-model",
+                created: created,
+                model: modelName,
                 choices: [choice],
                 usage: usage
-            )
+            ).encodeResponse(for: req)
         }
 
         try await app.execute()

@@ -10,9 +10,9 @@ Every request to `/v1/chat/completions` constructs a fresh `LanguageModelSession
 
 If you ever want to reuse a session, it must be scoped per logical client (e.g., per API key once auth exists), not global. Open a design doc before changing this.
 
-## No streaming
+## Streaming is additive
 
-The endpoint returns the full response text in a single JSON response. `stream: true` is not implemented yet — it should be additive (opt-in via the request flag) when added, not a replacement for the non-streaming path. See `docs/design-docs/openai-compatible-chat.md` for the forward-looking design.
+Non-streaming JSON is the default; `stream: true` opts into SSE per request. Keep it that way, and don't route the non-streaming path through the stream. Once the first SSE byte is sent the status is committed as `200`, so generation errors mid-stream come back as a content chunk plus `finish_reason: "error"`, not an HTTP error. Request validation (schemas, tools, `tool_choice`) runs before the stream opens, so those failures still return `400`. Details: `docs/ARCHITECTURE.md`.
 
 ## Locale support
 

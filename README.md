@@ -109,8 +109,18 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-Tool `parameters` use the same JSON Schema subset as `response_format.json_schema`. `tool_choice` accepts `auto` (default), `none`, `required`, and `{"type":"function","function":{"name":"..."}}`. FoundationModels cannot force a call, so `required` and a named function are instruction-level nudges. `parallel_tool_calls` is ignored. If the model calls several tools at once, all of them are reported. Tool calls aren't available with streaming yet.
+Tool `parameters` use the same JSON Schema subset as `response_format.json_schema`. `tool_choice` accepts `auto` (default), `none`, `required`, and `{"type":"function","function":{"name":"..."}}`. FoundationModels cannot force a call, so `required` and a named function are instruction-level nudges. `parallel_tool_calls` is ignored. If the model calls several tools at once, all of them are reported.
 
-Not implemented yet: streaming (`stream: true`), `n > 1`, `logprobs`, multimodal content. `usage` token counts are reported as zeros because `FoundationModels` does not surface them.
+### Streaming
+
+`"stream": true` returns OpenAI-style server-sent events (`chat.completion.chunk` deltas, then `data: [DONE]`). `stream_options.include_usage` adds a final usage chunk (zeros). Tools work in streaming mode too: a tool call ends the stream with a `tool_calls` delta and `finish_reason: "tool_calls"`. With `json_schema`, the JSON arrives in one chunk. Chunks are as coarse as FoundationModels' snapshots, usually a few words each.
+
+```bash
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"stream":true,"messages":[{"role":"user","content":"Count from 1 to 10 in words."}]}'
+```
+
+Not implemented yet: `n > 1`, `logprobs`, multimodal content. `usage` token counts are reported as zeros because `FoundationModels` does not surface them.
 
 Note: Apple Foundation Models currently reports `ru_RU` as unsupported on the tested machine, so Russian output may be unreliable even though the endpoint works.

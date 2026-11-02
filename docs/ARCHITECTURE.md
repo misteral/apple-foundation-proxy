@@ -19,7 +19,7 @@ Two endpoints, both on `127.0.0.1:8080`:
 | `GET`  | `/health` | Reports `FoundationModels` import status, runtime availability, and which locales `SystemLanguageModel.default` supports on the host. |
 | `POST` | `/v1/chat/completions` | OpenAI-shaped request/response envelope. Generates text from `messages` via `LanguageModelSession`. Supports `response_format` and `tools` / `tool_choice`. |
 
-The OpenAI compatibility covers text generation, structured output (`response_format`), and client-executed tool calls (`tools` / `tool_choice`). Missing on purpose for now: streaming, `n > 1`, `logprobs`, multimodal content. `usage` is returned with zero counts because `FoundationModels` does not expose token usage.
+The OpenAI compatibility covers text generation, structured output (`response_format`), and client-executed tool calls (`tools` / `tool_choice`). Streaming (`stream: true`) is supported for all of the above. Missing on purpose for now: `n > 1`, `logprobs`, multimodal content. `usage` is returned with zero counts because `FoundationModels` does not expose token usage.
 
 ## Request pipeline for `/v1/chat/completions`
 
@@ -28,8 +28,10 @@ The OpenAI compatibility covers text generation, structured output (`response_fo
 3. **`augmentInstructionsForJSONObject`** — when `type == "json_object"`, append a "respond with JSON only" directive to the instructions. FoundationModels has no native JSON mode, so this is best-effort.
 4. **`renderPrompt`** — renders all `user`/`assistant` history as a labeled transcript and appends an empty `Assistant:` cue when the last turn is from the user. A single-user-message prompt is returned verbatim with no transcript framing.
 5. **`buildGenerationSchema`** (only when `type == "json_schema"`) — translates the JSON Schema fragment into a `DynamicGenerationSchema` and wraps it in a `GenerationSchema`. Schema construction errors surface as `400` (run before opening the session so they don't get swallowed by the generic catch).
-6. **`LanguageModelSession`** — a fresh session is created **per request**. Constructed with `instructions:` when those exist, otherwise with no instructions. No streaming, no conversation state across requests.
+6. **`LanguageModelSession`** — a fresh session is created **per request**. Constructed with `instructions:` when those exist, otherwise with no instructions. No conversation state across requests.
 7. **Generate.** When a schema is present, call `respond(to:schema:)` and return `response.content.jsonString` as `choices[0].message.content`. Otherwise call `respond(to:)` and return the text response.
+
+8. **Stream** (only when `stream: true`) — instead of step 7, return an SSE response; see below.
 
 Without `tools`, history is prompt-stuffed (step 4). With `tools`, the pipeline switches to a native `Transcript` — see below.
 
@@ -46,6 +48,22 @@ OpenAI tools are executed by the **client**; FoundationModels tools are executed
 Replay matching: exact `(name, arguments)` first (order-insensitive JSON compare, reusable), then the first unconsumed result with the same tool name. The fallback exists because regeneration may phrase arguments slightly differently. Pending results for tools not attached this turn (e.g. `tool_choice: "none"`) are appended to the prompt as text.
 
 Tool-call IDs are generated per response (`call_<24 hex>`); they are not stable across requests, which matches OpenAI.
+
+## Streaming (`stream: true`)
+
+The non-streaming path stays the default; streaming is opt-in per request. The response is `text/event-stream` built by `makeSSEResponse` on Vapor's `Response.Body(managedAsyncStream:)`:
+
+1. A role chunk: `delta: {role: "assistant", content: ""}`.
+2. Content chunks from `session.streamResponse(to:)`. FoundationModels yields **cumulative snapshots**, not deltas; `streamDelta(previous:current:)` turns them into the incremental `delta.content` OpenAI clients expect. If a snapshot ever stops extending the previous one, the text after the common prefix is sent (SSE can't take back text).
+3. A finish chunk with an empty `delta` and `finish_reason` (`stop`, `tool_calls`, or `error`). Non-final chunks carry `finish_reason: null` explicitly.
+4. With `stream_options.include_usage: true`, a usage chunk (`choices: []`, zeros).
+5. `data: [DONE]`.
+
+Tools: `streamResponse` invokes `Tool.call` mid-stream (verified on device), so `ProxyTool` behaves exactly as in the non-streaming path. A recorded invocation ends the stream with one `tool_calls` delta chunk (all calls, `index`ed) and `finish_reason: "tool_calls"`. Any text streamed before the call stays sent.
+
+`json_schema` with `stream: true` is generated in full and sent as a single content chunk. Partial `GeneratedContent` snapshots re-serialize with the closing braces in different places, so they don't form a prefix-stable JSON text stream.
+
+Errors mid-stream mirror the non-streaming path: an `Error during generation: ...` content chunk plus `finish_reason: "error"`. HTTP status is already `200` by then.
 
 ## Supported JSON Schema subset (for `response_format.json_schema`)
 
@@ -84,6 +102,6 @@ On older toolchains, `/v1/chat/completions` returns a `[Mock Apple Intelligence 
 
 ## What this project is not
 
-- Not a full OpenAI emulator. The OpenAI shape is a calling convention; streaming, `n > 1`, `logprobs`, and vision are not implemented.
+- Not a full OpenAI emulator. The OpenAI shape is a calling convention; `n > 1`, `logprobs`, and vision are not implemented.
 - Not a chat assistant with memory. There is no server-side state across requests by design — clients send the full message history each turn.
 - Not production-ready as a network service. Local-only; see `docs/SECURITY.md`.

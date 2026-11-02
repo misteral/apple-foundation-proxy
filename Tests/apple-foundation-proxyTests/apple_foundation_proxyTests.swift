@@ -571,6 +571,77 @@ import FoundationModels
     }
 }
 
+// MARK: - Streaming
+
+@Suite struct StreamingTests {
+    private let factory = ChunkFactory(id: "chatcmpl-1", created: 42, model: "m")
+
+    private func decode(_ chunk: ChatCompletionChunk) throws -> [String: JSONValue] {
+        let data = try JSONEncoder().encode(chunk)
+        return try #require(try JSONDecoder().decode(JSONValue.self, from: data).objectValue)
+    }
+
+    @Test func deltaIsSuffixWhenSnapshotExtendsPrevious() {
+        #expect(streamDelta(previous: "", current: "Hello") == "Hello")
+        #expect(streamDelta(previous: "Hello", current: "Hello, world") == ", world")
+        #expect(streamDelta(previous: "Hello", current: "Hello") == "")
+    }
+
+    @Test func deltaFallsBackToCommonPrefixOnDivergence() {
+        #expect(streamDelta(previous: "Hello wor", current: "Hello there") == "there")
+    }
+
+    @Test func deltaHandlesMultiByteCharacters() {
+        #expect(streamDelta(previous: "Привет", current: "Привет, мир 👋") == ", мир 👋")
+    }
+
+    @Test func requestDecodesStreamFields() throws {
+        let json = #"{"messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}"#
+        let req = try JSONDecoder().decode(ChatCompletionRequest.self, from: Data(json.utf8))
+        #expect(req.stream == true)
+        #expect(req.stream_options?.include_usage == true)
+    }
+
+    @Test func sseEventFraming() throws {
+        let event = try sseEvent(factory.content("hi"))
+        #expect(event.hasPrefix("data: {"))
+        #expect(event.hasSuffix("}\n\n"))
+        #expect(sseDone == "data: [DONE]\n\n")
+    }
+
+    @Test func contentChunkKeepsNullFinishReasonAndOmitsUnsetDeltaFields() throws {
+        let obj = try decode(factory.content("hi"))
+        #expect(obj["object"] == .string("chat.completion.chunk"))
+        #expect(obj["id"] == .string("chatcmpl-1"))
+        #expect(obj["usage"] == nil)
+        let choice = try #require(obj["choices"]?.arrayValue?.first?.objectValue)
+        #expect(choice["finish_reason"] == .null)
+        #expect(choice["delta"] == .object(["content": .string("hi")]))
+    }
+
+    @Test func roleAndFinishChunks() throws {
+        let role = try #require(try decode(factory.role())["choices"]?.arrayValue?.first?.objectValue)
+        #expect(role["delta"] == .object(["role": .string("assistant"), "content": .string("")]))
+        let finish = try #require(try decode(factory.finish("stop"))["choices"]?.arrayValue?.first?.objectValue)
+        #expect(finish["delta"] == .object([:]))
+        #expect(finish["finish_reason"] == .string("stop"))
+    }
+
+    @Test func toolCallsChunkIndexesEachCall() throws {
+        let chunk = factory.toolCalls([.init(name: "a", arguments: "{}"), .init(name: "b", arguments: #"{"x":1}"#)])
+        let calls = try #require(chunk.choices.first?.delta.tool_calls)
+        #expect(calls.map(\.index) == [0, 1])
+        #expect(calls.map(\.function.name) == ["a", "b"])
+        #expect(calls.allSatisfy { $0.type == "function" && $0.id.hasPrefix("call_") })
+    }
+
+    @Test func usageChunkHasEmptyChoices() throws {
+        let obj = try decode(factory.usage())
+        #expect(obj["choices"] == .array([]))
+        #expect(obj["usage"]?.objectValue?["total_tokens"] == .int(0))
+    }
+}
+
 #if canImport(FoundationModels)
 
 @Suite struct ToolBridgeTests {
