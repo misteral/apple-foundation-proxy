@@ -367,6 +367,8 @@ func selectTools(
         }
     }
     switch choice {
+    case .required where tools.isEmpty:
+        throw Abort(.badRequest, reason: "tool_choice 'required' needs at least one entry in tools")
     case .auto, .required:
         return tools
     case .none:
@@ -378,6 +380,17 @@ func selectTools(
         }
         return matching
     }
+}
+
+/// Whether a request needs the tool-aware pipeline (native transcript + replay). True when
+/// tools are declared, and also when only the *history* has tool traffic: clients often omit
+/// `tools` on the final turn, and the prompt-stuffing path would silently drop `tool`
+/// results, so the model would make up an answer.
+func needsToolPipeline(
+    tools: [ChatCompletionRequest.ToolDefinition],
+    messages: [ChatCompletionRequest.Message]
+) -> Bool {
+    !tools.isEmpty || messages.contains { $0.role == "tool" || !($0.tool_calls ?? []).isEmpty }
 }
 
 /// A tool result the client already supplied for a call made after the latest user turn.
@@ -459,37 +472,55 @@ func parseJSONValue(_ json: String) -> JSONValue? {
     return try? JSONDecoder().decode(JSONValue.self, from: data)
 }
 
+/// Canonical form of tool arguments for replay matching: strings are trimmed, lowercased,
+/// and have inner whitespace collapsed, so `"Paris"` and `" paris "` match but `"London"`
+/// does not.
+func normalizedForMatching(_ value: JSONValue) -> JSONValue {
+    switch value {
+    case .string(let s):
+        let words = s.lowercased().split(whereSeparator: { $0.isWhitespace })
+        return .string(words.joined(separator: " "))
+    case .double(let d):
+        if let i = Int(exactly: d) { return .int(i) }
+        return value
+    case .array(let items):
+        return .array(items.map(normalizedForMatching))
+    case .object(let dict):
+        return .object(dict.mapValues(normalizedForMatching))
+    case .null, .bool, .int:
+        return value
+    }
+}
+
 /// Serves client-supplied tool results during replay.
 ///
-/// Lookup order: exact `(name, arguments)` match (reusable — re-asking the same question
-/// gets the same answer instead of bouncing back to the client), then the first unconsumed
-/// result for the same tool name (the model may phrase arguments slightly differently on
-/// regeneration). No match → the call is new and must go to the client.
-final class ToolReplayCache: @unchecked Sendable {
-    private let lock = NSLock()
+/// Lookup order: exact `(name, arguments)` match (order-insensitive JSON), then a match on
+/// normalized arguments (`normalizedForMatching`), because the model may vary casing or
+/// spacing when it regenerates. Matches are reusable: asking the same question again gets
+/// the same answer instead of going back to the client. Anything else is a new call and
+/// goes to the client. There is deliberately no "any result for this tool name" fallback:
+/// it would hand one call's result to a different call (Paris weather for London).
+struct ToolReplayCache: Sendable {
     private let results: [ReplayedToolResult]
-    private var consumed: Set<Int> = []
 
     init(_ results: [ReplayedToolResult]) {
         self.results = results
     }
 
     func result(name: String, arguments: String) -> String? {
-        lock.lock()
-        defer { lock.unlock() }
+        let candidates = results.filter { $0.name == name }
+        guard !candidates.isEmpty else { return nil }
 
-        let parsed = parseJSONValue(arguments)
-        if let i = results.firstIndex(where: {
-            $0.name == name && (parseJSONValue($0.arguments).map { $0 == parsed } ?? ($0.arguments == arguments))
-        }) {
-            consumed.insert(i)
-            return results[i].output
+        guard let parsed = parseJSONValue(arguments) else {
+            return candidates.first { $0.arguments == arguments }?.output
         }
-        if let i = results.indices.first(where: { !consumed.contains($0) && results[$0].name == name }) {
-            consumed.insert(i)
-            return results[i].output
+        if let exact = candidates.first(where: { parseJSONValue($0.arguments) == parsed }) {
+            return exact.output
         }
-        return nil
+        let normalized = normalizedForMatching(parsed)
+        return candidates.first(where: {
+            parseJSONValue($0.arguments).map(normalizedForMatching) == normalized
+        })?.output
     }
 }
 
@@ -529,12 +560,19 @@ func makeToolCallID() -> String {
 /// piece. Normally each snapshot extends the previous one; if it ever doesn't, SSE has no way
 /// to retract already-sent text, so we emit what follows the common prefix and accept the
 /// divergence rather than duplicating output.
+///
+/// Compares Unicode scalars, not `Character`s: a snapshot can end mid-grapheme (`e` before
+/// a combining accent, half of a flag or ZWJ emoji). Character comparison would then see no
+/// common prefix for that grapheme and re-send it. The client concatenates the scalars back
+/// into the right character.
 func streamDelta(previous: String, current: String) -> String {
-    if current.hasPrefix(previous) {
-        return String(current.dropFirst(previous.count))
+    let prev = previous.unicodeScalars
+    let cur = current.unicodeScalars
+    if cur.starts(with: prev) {
+        return String(String.UnicodeScalarView(cur.dropFirst(prev.count)))
     }
-    let common = current.commonPrefix(with: previous)
-    return String(current.dropFirst(common.count))
+    let common = zip(prev, cur).prefix(while: { $0 == $1 }).count
+    return String(String.UnicodeScalarView(cur.dropFirst(common)))
 }
 
 let sseDone = "data: [DONE]\n\n"
@@ -867,6 +905,12 @@ func buildTranscript(
 
 // MARK: - Streaming (FoundationModels bridge)
 
+/// Wraps a failed SSE write (client went away) so the streaming `catch` doesn't mistake it
+/// for a generation error and try to write an error chunk to a dead connection.
+struct StreamWriteFailed: Error {
+    let underlying: Error
+}
+
 @available(macOS 26.0, *)
 func makeStreamingCompletion(
     session: LanguageModelSession,
@@ -878,24 +922,37 @@ func makeStreamingCompletion(
     logger: Logger
 ) -> Response {
     makeSSEResponse(chunks: chunks, includeUsage: includeUsage) { writer in
+        func send(_ chunk: ChatCompletionChunk) async throws {
+            do {
+                try await writer.writeSSE(chunk)
+            } catch {
+                throw StreamWriteFailed(underlying: error)
+            }
+        }
+
         do {
             if let schema {
                 // Partial `GeneratedContent` snapshots re-serialize with closing braces in
                 // different places, so they aren't prefix-stable JSON. Structured output is
                 // generated in full and sent as a single content chunk.
                 let response = try await session.respond(to: prompt, schema: schema)
-                try await writer.writeSSE(chunks.content(response.content.jsonString))
+                try await send(chunks.content(response.content.jsonString))
             } else {
                 var previous = ""
                 for try await snapshot in session.streamResponse(to: prompt) {
                     let delta = streamDelta(previous: previous, current: snapshot.content)
                     previous = snapshot.content
                     if !delta.isEmpty {
-                        try await writer.writeSSE(chunks.content(delta))
+                        try await send(chunks.content(delta))
                     }
                 }
             }
             return "stop"
+        } catch let failure as StreamWriteFailed {
+            // Rethrowing ends the managed stream; leaving the `for await` loop drops the
+            // response stream.
+            logger.debug("Streaming client disconnected: \(failure.underlying)")
+            throw failure.underlying
         } catch {
             // Same contract as the non-streaming path: a recorded invocation means
             // `ProxyTool` aborted generation on purpose. Text streamed before it stays sent.
@@ -929,6 +986,9 @@ struct FoundationModelsProxy {
         }
 
         app.http.server.configuration.port = 8080
+        // Vapor's 16 KB default rejects (413) ordinary agent traffic: tool schemas plus a
+        // few tool results in the history go past it quickly.
+        app.routes.defaultMaxBodySize = "4mb"
         app.logger.info("Starting Apple FoundationModels proxy on http://127.0.0.1:8080")
 
         app.get("health") { _ -> HealthResponse in
@@ -984,9 +1044,9 @@ struct FoundationModelsProxy {
             let requestedTools = payload.tools ?? []
             let toolChoice = try parseToolChoice(payload.tool_choice)
             let activeTools = try selectTools(requestedTools, choice: toolChoice)
-            let conversation: ToolConversation? = requestedTools.isEmpty
-                ? nil
-                : try splitToolConversation(payload.messages)
+            let conversation: ToolConversation? = needsToolPipeline(tools: requestedTools, messages: payload.messages)
+                ? try splitToolConversation(payload.messages)
+                : nil
 
             if !activeTools.isEmpty, let directive = toolChoiceDirective(toolChoice) {
                 effectiveInstructions = [effectiveInstructions, directive]

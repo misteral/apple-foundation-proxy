@@ -451,6 +451,24 @@ import FoundationModels
         #expect(try selectTools(tools, choice: .function("b")).map(\.function.name) == ["b"])
     }
 
+    @Test func requiredChoiceWithoutToolsIsRejected() throws {
+        #expect(throws: Abort.self) { try selectTools([], choice: .required) }
+        #expect(try selectTools([], choice: .auto).isEmpty)
+        #expect(try selectTools([], choice: .none).isEmpty)
+    }
+
+    @Test func toolPipelineIsUsedForToolHistoryEvenWithoutTools() {
+        typealias Message = ChatCompletionRequest.Message
+        let plain = [Message(role: "user", content: "hi")]
+        #expect(!needsToolPipeline(tools: [], messages: plain))
+        #expect(needsToolPipeline(tools: [tool("a")], messages: plain))
+        #expect(needsToolPipeline(tools: [], messages: plain + [Message(role: "tool", content: "r", tool_call_id: "c1")]))
+        #expect(needsToolPipeline(tools: [], messages: [Message(role: "assistant", content: nil, tool_calls: [
+            .init(id: "c1", type: "function", function: .init(name: "f", arguments: "{}")),
+        ])]))
+        #expect(!needsToolPipeline(tools: [], messages: [Message(role: "assistant", content: "x", tool_calls: [])]))
+    }
+
     @Test func selectToolsRejectsBadDefinitions() {
         #expect(throws: Abort.self) { try selectTools([tool("a"), tool("a")], choice: .auto) }
         #expect(throws: Abort.self) { try selectTools([tool("a", type: "retrieval")], choice: .auto) }
@@ -548,14 +566,28 @@ import FoundationModels
         #expect(cache.result(name: "f", arguments: #"{"a":1,"b":2}"#) == "r1")
     }
 
-    @Test func fallsBackToUnconsumedResultWithSameName() {
+    @Test func matchesNormalizedArguments() {
         let cache = ToolReplayCache([
             .init(id: "c1", name: "f", arguments: #"{"city":"Paris"}"#, output: "r1"),
-            .init(id: "c2", name: "f", arguments: #"{"city":"Rome"}"#, output: "r2"),
+            .init(id: "c2", name: "f", arguments: #"{"city":"New  York","n":2.0}"#, output: "r2"),
         ])
-        #expect(cache.result(name: "f", arguments: #"{"city":"paris"}"#) == "r1")
-        #expect(cache.result(name: "f", arguments: #"{"city":"rome"}"#) == "r2")
-        #expect(cache.result(name: "f", arguments: #"{"city":"Berlin"}"#) == nil)
+        #expect(cache.result(name: "f", arguments: #"{"city":" paris "}"#) == "r1")
+        #expect(cache.result(name: "f", arguments: #"{"n":2,"city":"new york"}"#) == "r2")
+    }
+
+    @Test func neverHandsOneCallsResultToADifferentCall() {
+        // Regression: a name-only fallback used to return Paris's result for London.
+        let cache = ToolReplayCache([
+            .init(id: "c1", name: "get_weather", arguments: #"{"city":"Paris"}"#, output: "Sunny 31C"),
+        ])
+        #expect(cache.result(name: "get_weather", arguments: #"{"city":"London"}"#) == nil)
+        #expect(cache.result(name: "get_weather", arguments: #"{"city":"Paris"}"#) == "Sunny 31C")
+    }
+
+    @Test func nonJSONArgumentsMatchOnlyVerbatim() {
+        let cache = ToolReplayCache([.init(id: "c1", name: "f", arguments: "raw", output: "r")])
+        #expect(cache.result(name: "f", arguments: "raw") == "r")
+        #expect(cache.result(name: "f", arguments: "RAW") == nil)
     }
 
     @Test func unknownToolMisses() {
@@ -593,6 +625,26 @@ import FoundationModels
 
     @Test func deltaHandlesMultiByteCharacters() {
         #expect(streamDelta(previous: "Привет", current: "Привет, мир 👋") == ", мир 👋")
+    }
+
+    /// Replays a snapshot sequence the way a client would: by concatenating deltas.
+    private func streamed(_ snapshots: [String]) -> String {
+        var previous = ""
+        var out = ""
+        for snap in snapshots {
+            out += streamDelta(previous: previous, current: snap)
+            previous = snap
+        }
+        return out
+    }
+
+    @Test func snapshotsSplitMidGraphemeDoNotDuplicate() {
+        // Regression: Character-based diffing re-sent the base of a grapheme completed by
+        // the next snapshot ("cafee\u{301}!", "🇺🇺🇸").
+        #expect(streamed(["cafe", "cafe\u{301}", "cafe\u{301}!"]).unicodeScalars.elementsEqual("cafe\u{301}!".unicodeScalars))
+        #expect(streamed(["🇺", "🇺🇸"]).unicodeScalars.elementsEqual("🇺🇸".unicodeScalars))
+        let family = "👨\u{200D}👩\u{200D}👧"
+        #expect(streamed(["👨", "👨\u{200D}", family]).unicodeScalars.elementsEqual(family.unicodeScalars))
     }
 
     @Test func requestDecodesStreamFields() throws {

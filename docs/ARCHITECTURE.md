@@ -6,7 +6,7 @@ Single executable Swift package, one source file:
 
 - `Package.swift` — declares the `apple-foundation-proxy` executable target with one external dependency (Vapor 4.89+). `swift-tools-version: 5.10`. Platform floor is `macOS(.v14)` so the package resolves on older Macs; the FoundationModels code path itself requires macOS 26.
 - `Sources/apple-foundation-proxy/main.swift` — DTOs, prompt helpers, route handlers, and `@main` entry point. There is no module split.
-- `Tests/apple-foundation-proxyTests/apple_foundation_proxyTests.swift` — Swift Testing scaffolding (currently a single placeholder `@Test`).
+- `Tests/apple-foundation-proxyTests/apple_foundation_proxyTests.swift` — Swift Testing suites for the pure helpers and the FoundationModels bridges (see `docs/TESTING.md`).
 
 Adding files is fine when something genuinely doesn't fit, but the design intent is "small, readable, one-process local tool." Resist module splits that exist only to mirror larger projects.
 
@@ -23,6 +23,9 @@ The OpenAI compatibility covers text generation, structured output (`response_fo
 
 ## Request pipeline for `/v1/chat/completions`
 
+The request body limit is raised to 4 MB (`app.routes.defaultMaxBodySize`). Vapor's 16 KB default returns `413` for ordinary agent traffic with tool schemas and tool results.
+
+
 1. **Validate `response_format.type`** (one of `text` / `json_object` / `json_schema`); reject unknown values with `400`. For `json_schema`, require a `json_schema` payload.
 2. **`systemInstructions`** — joins all `system` and `developer` role messages into one instructions block (newline-separated). Returns nil when the request has none.
 3. **`augmentInstructionsForJSONObject`** — when `type == "json_object"`, append a "respond with JSON only" directive to the instructions. FoundationModels has no native JSON mode, so this is best-effort.
@@ -37,15 +40,15 @@ Without `tools`, history is prompt-stuffed (step 4). With `tools`, the pipeline 
 
 ## Tool calls (`tools` / `tool_choice`)
 
-OpenAI tools are executed by the **client**; FoundationModels tools are executed **in-process** by the session. The bridge is a pass-through `ProxyTool` per OpenAI definition:
+OpenAI tools are executed by the **client**; FoundationModels tools are executed **in-process** by the session. The bridge is a pass-through `ProxyTool` per OpenAI definition. The tool pipeline runs when the request declares `tools` **or** its history contains tool traffic (`needsToolPipeline`). Clients often omit `tools` on the final turn, and the prompt-stuffing path would drop the `tool` results.
 
-1. **`parseToolChoice` + `selectTools`** — validate definitions (`type: "function"`, non-empty unique names) and apply `tool_choice`. `none` attaches no tools; a named function attaches only that tool. `required` / named function also add an instruction nudge (`toolChoiceDirective`) — FoundationModels cannot force a call.
+1. **`parseToolChoice` + `selectTools`** — validate definitions (`type: "function"`, non-empty unique names) and apply `tool_choice` (`required` with no tools is a `400`, as in OpenAI). `none` attaches no tools; a named function attaches only that tool. `required` / named function also add an instruction nudge (`toolChoiceDirective`) — FoundationModels cannot force a call.
 2. **`splitToolConversation`** — the latest `user` message is the prompt; everything before it is history; `tool` results *after* it are pending results of the in-flight turn.
 3. **`buildProxyTools`** — `function.parameters` goes through the same JSON Schema bridge as `response_format` (missing `parameters` = empty object). Unsupported schemas are `400`s.
 4. **`buildTranscript`** — history becomes native `Transcript` entries: instructions (with tool definitions), prompts, responses, `toolCalls`, `toolOutput`. The session is `LanguageModelSession(tools:transcript:)`.
 5. **Generate.** When the model calls a tool, `ProxyTool.call` either returns a pending client result from `ToolReplayCache` (replaying the round-trip), or records the call in `ToolInvocationRecorder` and throws `ProxyToolInvocation` to abort generation. Any non-empty recorder after a thrown error → response with `content: null`, `tool_calls`, `finish_reason: "tool_calls"`.
 
-Replay matching: exact `(name, arguments)` first (order-insensitive JSON compare, reusable), then the first unconsumed result with the same tool name. The fallback exists because regeneration may phrase arguments slightly differently. Pending results for tools not attached this turn (e.g. `tool_choice: "none"`) are appended to the prompt as text.
+Replay matching (`ToolReplayCache`): exact `(name, arguments)` first (order-insensitive JSON compare), then the same comparison on normalized arguments (`normalizedForMatching`: strings trimmed, lowercased, whitespace collapsed; `2.0` == `2`), because regeneration may vary casing or spacing. Matches are reusable. There is no name-only fallback, because it would hand one call's result to a different call (Paris weather for London). An unmatched call goes back to the client as a new `tool_calls`. Pending results for tools not attached this turn (e.g. `tool_choice: "none"`) are appended to the prompt as text.
 
 Tool-call IDs are generated per response (`call_<24 hex>`); they are not stable across requests, which matches OpenAI.
 
@@ -63,7 +66,7 @@ Tools: `streamResponse` invokes `Tool.call` mid-stream (verified on device), so 
 
 `json_schema` with `stream: true` is generated in full and sent as a single content chunk. Partial `GeneratedContent` snapshots re-serialize with the closing braces in different places, so they don't form a prefix-stable JSON text stream.
 
-Errors mid-stream mirror the non-streaming path: an `Error during generation: ...` content chunk plus `finish_reason: "error"`. HTTP status is already `200` by then.
+A failed SSE write (client disconnected) is told apart from a generation error (`StreamWriteFailed`). It ends the stream quietly, without an error chunk or error log. Errors mid-stream mirror the non-streaming path: an `Error during generation: ...` content chunk plus `finish_reason: "error"`. HTTP status is already `200` by then.
 
 ## Supported JSON Schema subset (for `response_format.json_schema`)
 
