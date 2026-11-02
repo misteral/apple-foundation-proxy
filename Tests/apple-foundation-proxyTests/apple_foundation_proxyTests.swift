@@ -362,3 +362,309 @@ import FoundationModels
 }
 
 #endif
+
+// MARK: - Tool calls: request decoding
+
+@Suite struct ToolRequestDecodingTests {
+    @Test func decodesToolsToolChoiceAndToolMessages() throws {
+        let json = #"""
+        {
+          "model":"m",
+          "messages":[
+            {"role":"user","content":"weather?"},
+            {"role":"assistant","content":null,"tool_calls":[
+              {"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}
+            ]},
+            {"role":"tool","tool_call_id":"call_1","content":"18C"}
+          ],
+          "tools":[{"type":"function","function":{"name":"get_weather","description":"Get weather",
+            "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],
+          "tool_choice":"auto"
+        }
+        """#
+        let req = try JSONDecoder().decode(ChatCompletionRequest.self, from: Data(json.utf8))
+        #expect(req.tools?.first?.function.name == "get_weather")
+        #expect(req.tool_choice == .string("auto"))
+        #expect(req.messages[1].content == nil)
+        #expect(req.messages[1].tool_calls?.first?.function.arguments == #"{"city":"Paris"}"#)
+        #expect(req.messages[2].tool_call_id == "call_1")
+    }
+
+    @Test func responseMessageEncodesNullContentAndToolCalls() throws {
+        let msg = ChatCompletionResponse.Choice.Message(
+            role: "assistant",
+            content: nil,
+            tool_calls: [.init(id: "call_1", type: "function", function: .init(name: "f", arguments: "{}"))]
+        )
+        let data = try JSONEncoder().encode(msg)
+        let obj = try #require(try JSONDecoder().decode(JSONValue.self, from: data).objectValue)
+        #expect(obj["content"] == .null)
+        #expect(obj["tool_calls"]?.arrayValue?.count == 1)
+    }
+
+    @Test func responseMessageOmitsToolCallsWhenAbsent() throws {
+        let data = try JSONEncoder().encode(ChatCompletionResponse.Choice.Message(role: "assistant", content: "hi"))
+        let obj = try #require(try JSONDecoder().decode(JSONValue.self, from: data).objectValue)
+        #expect(obj["content"] == .string("hi"))
+        #expect(obj["tool_calls"] == nil)
+    }
+}
+
+// MARK: - Tool calls: tool_choice / selection
+
+@Suite struct ToolChoiceTests {
+    typealias Def = ChatCompletionRequest.ToolDefinition
+
+    private func tool(_ name: String, type: String = "function") -> Def {
+        Def(type: type, function: .init(name: name, description: nil, parameters: nil, strict: nil))
+    }
+
+    @Test func parsesAllForms() throws {
+        #expect(try parseToolChoice(nil) == .auto)
+        #expect(try parseToolChoice(.null) == .auto)
+        #expect(try parseToolChoice(.string("auto")) == .auto)
+        #expect(try parseToolChoice(.string("none")) == .none)
+        #expect(try parseToolChoice(.string("required")) == .required)
+        let named: JSONValue = .object([
+            "type": .string("function"),
+            "function": .object(["name": .string("f")]),
+        ])
+        #expect(try parseToolChoice(named) == .function("f"))
+    }
+
+    @Test func rejectsInvalidChoice() {
+        #expect(throws: Abort.self) { try parseToolChoice(.string("sometimes")) }
+        #expect(throws: Abort.self) { try parseToolChoice(.object(["type": .string("function")])) }
+    }
+
+    @Test func directiveOnlyForForcingChoices() {
+        #expect(toolChoiceDirective(.auto) == nil)
+        #expect(toolChoiceDirective(.none) == nil)
+        #expect(toolChoiceDirective(.required) != nil)
+        #expect(toolChoiceDirective(.function("f"))?.contains("'f'") == true)
+    }
+
+    @Test func selectToolsAppliesChoice() throws {
+        let tools = [tool("a"), tool("b")]
+        #expect(try selectTools(tools, choice: .auto).map(\.function.name) == ["a", "b"])
+        #expect(try selectTools(tools, choice: .none).isEmpty)
+        #expect(try selectTools(tools, choice: .function("b")).map(\.function.name) == ["b"])
+    }
+
+    @Test func selectToolsRejectsBadDefinitions() {
+        #expect(throws: Abort.self) { try selectTools([tool("a"), tool("a")], choice: .auto) }
+        #expect(throws: Abort.self) { try selectTools([tool("a", type: "retrieval")], choice: .auto) }
+        #expect(throws: Abort.self) { try selectTools([tool("")], choice: .auto) }
+        #expect(throws: Abort.self) { try selectTools([tool("a")], choice: .function("zzz")) }
+    }
+}
+
+// MARK: - Tool calls: conversation split & replay
+
+@Suite struct ToolConversationTests {
+    typealias Message = ChatCompletionRequest.Message
+    typealias Call = ChatCompletionRequest.ToolCall
+
+    private func call(_ id: String, _ name: String, _ args: String) -> Call {
+        Call(id: id, type: "function", function: .init(name: name, arguments: args))
+    }
+
+    @Test func plainConversationHasNoPendingResults() throws {
+        let conv = try splitToolConversation([
+            Message(role: "system", content: "sys"),
+            Message(role: "user", content: "hi"),
+            Message(role: "assistant", content: "hello"),
+            Message(role: "user", content: "again"),
+        ])
+        #expect(conv.prompt == "again")
+        #expect(conv.history.count == 3)
+        #expect(conv.pendingResults.isEmpty)
+    }
+
+    @Test func trailingToolRoundTripsBecomePendingResults() throws {
+        let conv = try splitToolConversation([
+            Message(role: "user", content: "weather in Paris and Rome?"),
+            Message(role: "assistant", content: nil, tool_calls: [
+                call("c1", "get_weather", #"{"city":"Paris"}"#),
+                call("c2", "get_weather", #"{"city":"Rome"}"#),
+            ]),
+            Message(role: "tool", content: "18C", tool_call_id: "c1"),
+            Message(role: "tool", content: "25C", tool_call_id: "c2"),
+        ])
+        #expect(conv.prompt == "weather in Paris and Rome?")
+        #expect(conv.history.isEmpty)
+        #expect(conv.pendingResults == [
+            .init(id: "c1", name: "get_weather", arguments: #"{"city":"Paris"}"#, output: "18C"),
+            .init(id: "c2", name: "get_weather", arguments: #"{"city":"Rome"}"#, output: "25C"),
+        ])
+    }
+
+    @Test func toolRoundTripsBeforeLastUserStayInHistory() throws {
+        let conv = try splitToolConversation([
+            Message(role: "user", content: "q1"),
+            Message(role: "assistant", content: nil, tool_calls: [call("c1", "f", "{}")]),
+            Message(role: "tool", content: "r1", tool_call_id: "c1"),
+            Message(role: "assistant", content: "a1"),
+            Message(role: "user", content: "q2"),
+        ])
+        #expect(conv.prompt == "q2")
+        #expect(conv.history.count == 4)
+        #expect(conv.pendingResults.isEmpty)
+    }
+
+    @Test func rejectsMissingUserAndDanglingToolResults() {
+        #expect(throws: Abort.self) {
+            try splitToolConversation([Message(role: "system", content: "s")])
+        }
+        #expect(throws: Abort.self) {
+            try splitToolConversation([
+                Message(role: "user", content: "q"),
+                Message(role: "tool", content: "r", tool_call_id: "nope"),
+            ])
+        }
+        #expect(throws: Abort.self) {
+            try splitToolConversation([
+                Message(role: "user", content: "q"),
+                Message(role: "tool", content: "r"),
+            ])
+        }
+    }
+
+    @Test func appendToolResultsRendersEachResult() {
+        #expect(appendToolResultsToPrompt("q", results: []) == "q")
+        let out = appendToolResultsToPrompt("q", results: [
+            .init(id: "c1", name: "f", arguments: #"{"x":1}"#, output: "ok"),
+        ])
+        #expect(out == "q\n\nTool results:\n- f({\"x\":1}): ok")
+    }
+}
+
+@Suite struct ToolReplayCacheTests {
+    @Test func exactArgumentMatchIsOrderInsensitiveAndReusable() {
+        let cache = ToolReplayCache([
+            .init(id: "c1", name: "f", arguments: #"{"a":1,"b":2}"#, output: "r1"),
+        ])
+        #expect(cache.result(name: "f", arguments: #"{"b":2,"a":1}"#) == "r1")
+        #expect(cache.result(name: "f", arguments: #"{"a":1,"b":2}"#) == "r1")
+    }
+
+    @Test func fallsBackToUnconsumedResultWithSameName() {
+        let cache = ToolReplayCache([
+            .init(id: "c1", name: "f", arguments: #"{"city":"Paris"}"#, output: "r1"),
+            .init(id: "c2", name: "f", arguments: #"{"city":"Rome"}"#, output: "r2"),
+        ])
+        #expect(cache.result(name: "f", arguments: #"{"city":"paris"}"#) == "r1")
+        #expect(cache.result(name: "f", arguments: #"{"city":"rome"}"#) == "r2")
+        #expect(cache.result(name: "f", arguments: #"{"city":"Berlin"}"#) == nil)
+    }
+
+    @Test func unknownToolMisses() {
+        let cache = ToolReplayCache([.init(id: "c1", name: "f", arguments: "{}", output: "r")])
+        #expect(cache.result(name: "g", arguments: "{}") == nil)
+    }
+
+    @Test func recorderKeepsInvocationsInOrder() {
+        let recorder = ToolInvocationRecorder()
+        recorder.record(name: "a", arguments: "{}")
+        recorder.record(name: "b", arguments: #"{"x":1}"#)
+        #expect(recorder.invocations == [.init(name: "a", arguments: "{}"), .init(name: "b", arguments: #"{"x":1}"#)])
+    }
+}
+
+#if canImport(FoundationModels)
+
+@Suite struct ToolBridgeTests {
+    typealias Def = ChatCompletionRequest.ToolDefinition
+    typealias Message = ChatCompletionRequest.Message
+
+    private let weather = Def(type: "function", function: .init(
+        name: "get_weather",
+        description: "Get weather",
+        parameters: .object([
+            "type": .string("object"),
+            "properties": .object(["city": .object(["type": .string("string")])]),
+            "required": .array([.string("city")]),
+            "additionalProperties": .bool(false),
+        ]),
+        strict: true
+    ))
+
+    @Test func buildsProxyToolsIncludingParameterlessTools() throws {
+        guard #available(macOS 26.0, *) else { return }
+        let noParams = Def(type: "function", function: .init(name: "now", description: nil, parameters: nil, strict: nil))
+        let tools = try buildProxyTools(
+            [weather, noParams],
+            replay: ToolReplayCache([]),
+            recorder: ToolInvocationRecorder()
+        )
+        #expect(tools.map(\.name) == ["get_weather", "now"])
+        #expect(tools[0].description == "Get weather")
+    }
+
+    @Test func rejectsUnsupportedParameterSchema() throws {
+        guard #available(macOS 26.0, *) else { return }
+        let bad = Def(type: "function", function: .init(
+            name: "f", description: nil,
+            parameters: .object(["type": .string("object"), "oneOf": .array([])]),
+            strict: nil
+        ))
+        #expect(throws: Abort.self) {
+            try buildProxyTools([bad], replay: ToolReplayCache([]), recorder: ToolInvocationRecorder())
+        }
+    }
+
+    @Test func proxyToolReplaysCachedResultOrRecordsAndThrows() async throws {
+        guard #available(macOS 26.0, *) else { return }
+        let recorder = ToolInvocationRecorder()
+        let replay = ToolReplayCache([.init(id: "c1", name: "get_weather", arguments: #"{"city":"Paris"}"#, output: "18C")])
+        let tool = try #require(try buildProxyTools([weather], replay: replay, recorder: recorder).first)
+
+        let cached = try await tool.call(arguments: GeneratedContent(json: #"{"city":"Paris"}"#))
+        #expect(cached == "18C")
+        #expect(recorder.invocations.isEmpty)
+
+        await #expect(throws: ProxyToolInvocation.self) {
+            _ = try await tool.call(arguments: GeneratedContent(json: #"{"city":"Rome"}"#))
+        }
+        #expect(recorder.invocations.map(\.name) == ["get_weather"])
+        #expect(parseJSONValue(recorder.invocations[0].arguments) == .object(["city": .string("Rome")]))
+    }
+
+    @Test func transcriptContainsNativeToolEntries() throws {
+        guard #available(macOS 26.0, *) else { return }
+        let tools = try buildProxyTools([weather], replay: ToolReplayCache([]), recorder: ToolInvocationRecorder())
+        let transcript = try buildTranscript(instructions: "be brief", tools: tools, history: [
+            Message(role: "system", content: "be brief"),
+            Message(role: "user", content: "weather?"),
+            Message(role: "assistant", content: nil, tool_calls: [
+                .init(id: "c1", type: "function", function: .init(name: "get_weather", arguments: #"{"city":"Paris"}"#)),
+            ]),
+            Message(role: "tool", content: "18C", tool_call_id: "c1"),
+            Message(role: "assistant", content: "It's 18C."),
+        ])
+        let kinds: [String] = transcript.map { entry in
+            switch entry {
+            case .instructions(let i): return "instructions(\(i.toolDefinitions.count))"
+            case .prompt: return "prompt"
+            case .toolCalls(let c): return "toolCalls(\(c.count))"
+            case .toolOutput(let o): return "toolOutput(\(o.toolName))"
+            case .response: return "response"
+            @unknown default: return "unknown"
+            }
+        }
+        #expect(kinds == ["instructions(1)", "prompt", "toolCalls(1)", "toolOutput(get_weather)", "response"])
+    }
+
+    @Test func transcriptRejectsInvalidToolCallArguments() throws {
+        guard #available(macOS 26.0, *) else { return }
+        #expect(throws: Abort.self) {
+            try buildTranscript(instructions: nil, tools: [], history: [
+                Message(role: "assistant", content: nil, tool_calls: [
+                    .init(id: "c1", type: "function", function: .init(name: "f", arguments: "not json")),
+                ]),
+            ])
+        }
+    }
+}
+
+#endif

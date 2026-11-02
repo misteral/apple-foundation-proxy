@@ -92,6 +92,25 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-Not implemented yet: streaming (`stream: true`), `tools` / `tool_choice`, `n > 1`, `logprobs`, multimodal content. `usage` token counts are reported as zeros because `FoundationModels` does not surface them.
+### Tools
+
+`tools` / `tool_choice` follow the OpenAI round-trip: the proxy never executes tools itself. When the model wants a tool, the response has `finish_reason: "tool_calls"`, `content: null`, and `tool_calls`. Execute the tool on your side, then resend the conversation with the `assistant` message (with its `tool_calls`) and a `role: "tool"` message per result (`tool_call_id` + `content`).
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages":[{"role":"user","content":"What is the weather in Paris?"}],
+    "tools":[{"type":"function","function":{
+      "name":"get_weather",
+      "description":"Get the current weather for a city",
+      "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}
+    }}]
+  }'
+```
+
+Tool `parameters` use the same JSON Schema subset as `response_format.json_schema`. `tool_choice` accepts `auto` (default), `none`, `required`, and `{"type":"function","function":{"name":"..."}}`. FoundationModels cannot force a call, so `required` and a named function are instruction-level nudges. `parallel_tool_calls` is ignored. If the model calls several tools at once, all of them are reported. Tool calls aren't available with streaming yet.
+
+Not implemented yet: streaming (`stream: true`), `n > 1`, `logprobs`, multimodal content. `usage` token counts are reported as zeros because `FoundationModels` does not surface them.
 
 Note: Apple Foundation Models currently reports `ru_RU` as unsupported on the tested machine, so Russian output may be unreliable even though the endpoint works.

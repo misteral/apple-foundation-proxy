@@ -22,7 +22,8 @@ The pure helpers in `main.swift` are the high-leverage targets — they are dete
 - `renderPrompt(from:)` — single-user-message passthrough, multi-turn transcript rendering, `Assistant:` cue only when the last turn is `user`, behavior when only `system` messages are present.
 - `augmentInstructionsForJSONObject(_:)` — appends the JSON directive verbatim when no base instructions, joins with `\n\n` otherwise.
 - `JSONValue` decoding — primitives, arrays, objects, round-trip through `JSONEncoder`/`JSONDecoder`, accessor helpers.
-- `ChatCompletionRequest` decoding — verify `response_format` and nested `json_schema` decode from the OpenAI wire format.
+- `ChatCompletionRequest` decoding — verify `response_format` and nested `json_schema` decode from the OpenAI wire format; `tools`, `tool_choice`, `tool_calls`, `tool_call_id`, null `content`.
+- Tool helpers — `parseToolChoice`, `toolChoiceDirective`, `selectTools`, `splitToolConversation`, `appendToolResultsToPrompt`, `ToolReplayCache`, `ToolInvocationRecorder`. `buildProxyTools`, `ProxyTool.call`, and `buildTranscript` are FoundationModels-gated like the schema bridge.
 
 The `buildGenerationSchema(from:)` bridge requires `FoundationModels` types, so its tests are gated behind `#if canImport(FoundationModels)` and skip at runtime via `#available(macOS 26.0, *)` on older OSes. Cover both happy paths (object/array/enum/scalar) and the rejection cases (`oneOf`/`anyOf`/`allOf`/`$ref`/`pattern`/`format`/`additionalProperties`, missing `items`, unknown `type`, non-object fragment, missing `schema`).
 
@@ -45,3 +46,4 @@ Confirm that:
 - `/health` reports `runtimeSupported: true` and `modelAvailability: "available"` on an Apple Intelligence-capable Mac.
 - The chat response is a sensible answer that respects the `system` message (try with and without a `system` message).
 - Multi-turn requests (a `user`/`assistant`/`user` sequence) produce output that reflects the prior turns.
+- A request with `tools` that needs a tool returns `finish_reason: "tool_calls"`; posting the `assistant` `tool_calls` + `tool` result back yields a final answer using the result. See the tools example in `README.md`.

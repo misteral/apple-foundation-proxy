@@ -77,9 +77,50 @@ indirect enum JSONValue: Codable, Sendable, Equatable {
 // MARK: - OpenAI Compatible DTOs
 
 struct ChatCompletionRequest: Content {
+    /// An OpenAI `tool_calls[]` entry. Shared by request history and response payloads.
+    struct ToolCall: Content, Equatable {
+        struct Function: Content, Equatable {
+            let name: String
+            /// JSON-encoded arguments, as a string (OpenAI wire format).
+            let arguments: String
+        }
+        let id: String
+        let type: String?
+        let function: Function
+    }
+
     struct Message: Content {
         let role: String
-        let content: String
+        /// Nil for assistant messages that only carry `tool_calls`.
+        let content: String?
+        let tool_calls: [ToolCall]?
+        let tool_call_id: String?
+        let name: String?
+
+        init(
+            role: String,
+            content: String?,
+            tool_calls: [ToolCall]? = nil,
+            tool_call_id: String? = nil,
+            name: String? = nil
+        ) {
+            self.role = role
+            self.content = content
+            self.tool_calls = tool_calls
+            self.tool_call_id = tool_call_id
+            self.name = name
+        }
+    }
+
+    struct ToolDefinition: Content {
+        struct Function: Content {
+            let name: String
+            let description: String?
+            let parameters: JSONValue?
+            let strict: Bool?
+        }
+        let type: String
+        let function: Function
     }
 
     struct ResponseFormat: Content {
@@ -97,13 +138,32 @@ struct ChatCompletionRequest: Content {
     let model: String?
     let messages: [Message]
     let response_format: ResponseFormat?
+    let tools: [ToolDefinition]?
+    /// `"auto"`, `"none"`, `"required"`, or `{"type":"function","function":{"name":...}}`.
+    let tool_choice: JSONValue?
 }
 
 struct ChatCompletionResponse: Content {
     struct Choice: Content {
         struct Message: Content {
             let role: String
-            let content: String
+            let content: String?
+            let tool_calls: [ChatCompletionRequest.ToolCall]?
+
+            init(role: String, content: String?, tool_calls: [ChatCompletionRequest.ToolCall]? = nil) {
+                self.role = role
+                self.content = content
+                self.tool_calls = tool_calls
+            }
+
+            // OpenAI always emits `content` (as `null` on tool-call turns); some clients
+            // require the key to be present, so don't let synthesized Codable drop it.
+            func encode(to encoder: Encoder) throws {
+                var c = encoder.container(keyedBy: CodingKeys.self)
+                try c.encode(role, forKey: .role)
+                try c.encode(content, forKey: .content)
+                try c.encodeIfPresent(tool_calls, forKey: .tool_calls)
+            }
         }
         let index: Int
         let message: Message
@@ -131,6 +191,13 @@ struct HealthResponse: Content {
     let currentLocaleSupported: Bool?
     let enUSSupported: Bool?
     let ruRUSupported: Bool?
+    let capabilities: Capabilities
+
+    struct Capabilities: Content {
+        let streaming: Bool
+        let toolCalls: Bool
+        let structuredOutput: Bool
+    }
 }
 
 // MARK: - Prompt assembly
@@ -140,7 +207,7 @@ struct HealthResponse: Content {
 func systemInstructions(from messages: [ChatCompletionRequest.Message]) -> String? {
     let parts = messages
         .filter { $0.role == "system" || $0.role == "developer" }
-        .map(\.content)
+        .compactMap(\.content)
     guard !parts.isEmpty else { return nil }
     return parts.joined(separator: "\n\n")
 }
@@ -159,16 +226,16 @@ func renderPrompt(from messages: [ChatCompletionRequest.Message]) -> String {
     let history = convo.dropLast()
 
     if history.isEmpty {
-        return last.content
+        return last.content ?? ""
     }
 
     var lines: [String] = []
     for msg in history {
         let label = msg.role == "user" ? "User" : "Assistant"
-        lines.append("\(label): \(msg.content)")
+        lines.append("\(label): \(msg.content ?? "")")
     }
     let lastLabel = last.role == "user" ? "User" : "Assistant"
-    lines.append("\(lastLabel): \(last.content)")
+    lines.append("\(lastLabel): \(last.content ?? "")")
     if last.role == "user" {
         lines.append("Assistant:")
     }
@@ -190,6 +257,223 @@ func augmentInstructionsForJSONObject(_ base: String?) -> String {
         return base + "\n\n" + jsonObjectDirective
     }
     return jsonObjectDirective
+}
+
+// MARK: - Tool calls (pure helpers)
+
+/// Parsed OpenAI `tool_choice`.
+enum ToolChoice: Equatable {
+    case auto
+    case none
+    case required
+    case function(String)
+}
+
+func parseToolChoice(_ value: JSONValue?) throws -> ToolChoice {
+    switch value {
+    case nil, .null:
+        return .auto
+    case .string("auto"):
+        return .auto
+    case .string("none"):
+        return .none
+    case .string("required"):
+        return .required
+    case .object(let dict):
+        if dict["type"]?.stringValue == "function",
+           let name = dict["function"]?.objectValue?["name"]?.stringValue {
+            return .function(name)
+        }
+        throw Abort(.badRequest, reason: "tool_choice object must be {\"type\":\"function\",\"function\":{\"name\":...}}")
+    default:
+        throw Abort(.badRequest, reason: "Unsupported tool_choice value")
+    }
+}
+
+/// FoundationModels has no way to force a tool call, so `required` / named-function
+/// choices degrade to an instruction-level nudge.
+func toolChoiceDirective(_ choice: ToolChoice) -> String? {
+    switch choice {
+    case .auto, .none:
+        return nil
+    case .required:
+        return "You MUST call one of the available tools before answering."
+    case .function(let name):
+        return "You MUST call the tool '\(name)' before answering."
+    }
+}
+
+/// Validates `tools` and applies `tool_choice`, returning the definitions that should be
+/// attached to the session (empty for `tool_choice: "none"`).
+func selectTools(
+    _ tools: [ChatCompletionRequest.ToolDefinition],
+    choice: ToolChoice
+) throws -> [ChatCompletionRequest.ToolDefinition] {
+    var seen = Set<String>()
+    for tool in tools {
+        guard tool.type == "function" else {
+            throw Abort(.badRequest, reason: "Unsupported tool type '\(tool.type)'; only 'function' is supported")
+        }
+        guard !tool.function.name.isEmpty else {
+            throw Abort(.badRequest, reason: "tools[].function.name must not be empty")
+        }
+        guard seen.insert(tool.function.name).inserted else {
+            throw Abort(.badRequest, reason: "Duplicate tool name '\(tool.function.name)'")
+        }
+    }
+    switch choice {
+    case .auto, .required:
+        return tools
+    case .none:
+        return []
+    case .function(let name):
+        let matching = tools.filter { $0.function.name == name }
+        guard !matching.isEmpty else {
+            throw Abort(.badRequest, reason: "tool_choice references unknown tool '\(name)'")
+        }
+        return matching
+    }
+}
+
+/// A tool result the client already supplied for a call made after the latest user turn.
+struct ReplayedToolResult: Equatable {
+    let id: String
+    let name: String
+    let arguments: String
+    let output: String
+}
+
+/// A request's messages split for the tool-call round-trip.
+///
+/// FoundationModels can only *continue* a session by responding to a new prompt, so the
+/// latest `user` message is always the prompt. Everything before it becomes transcript
+/// history. Tool calls/results *after* it belong to the in-flight turn: they are replayed by
+/// re-running generation and having `ProxyTool` hand back the client's results instead of
+/// surfacing the call again.
+struct ToolConversation {
+    let history: [ChatCompletionRequest.Message]
+    let prompt: String
+    let pendingResults: [ReplayedToolResult]
+}
+
+func splitToolConversation(_ messages: [ChatCompletionRequest.Message]) throws -> ToolConversation {
+    guard let lastUser = messages.lastIndex(where: { $0.role == "user" }) else {
+        throw Abort(.badRequest, reason: "messages must contain at least one 'user' message")
+    }
+    let trailing = messages[(lastUser + 1)...]
+
+    var callsByID: [String: ChatCompletionRequest.ToolCall] = [:]
+    var results: [ReplayedToolResult] = []
+    for msg in trailing {
+        switch msg.role {
+        case "assistant":
+            for call in msg.tool_calls ?? [] {
+                callsByID[call.id] = call
+            }
+        case "tool":
+            guard let id = msg.tool_call_id else {
+                throw Abort(.badRequest, reason: "'tool' messages require tool_call_id")
+            }
+            guard let call = callsByID[id] else {
+                throw Abort(.badRequest, reason: "tool message references unknown tool_call_id '\(id)'")
+            }
+            results.append(.init(
+                id: id,
+                name: call.function.name,
+                arguments: call.function.arguments,
+                output: msg.content ?? ""
+            ))
+        default:
+            // Trailing assistant prose or system messages can't be placed after the prompt
+            // in a transcript; they're dropped. Real clients don't send these.
+            continue
+        }
+    }
+
+    return ToolConversation(
+        history: Array(messages[..<lastUser]),
+        prompt: messages[lastUser].content ?? "",
+        pendingResults: results
+    )
+}
+
+/// Renders pending tool results as text, for when they can't be replayed through tools
+/// (e.g. `tool_choice: "none"`).
+func appendToolResultsToPrompt(_ prompt: String, results: [ReplayedToolResult]) -> String {
+    guard !results.isEmpty else { return prompt }
+    var lines = [prompt, "", "Tool results:"]
+    for r in results {
+        lines.append("- \(r.name)(\(r.arguments)): \(r.output)")
+    }
+    return lines.joined(separator: "\n")
+}
+
+/// Parses a JSON string into a `JSONValue` for order-insensitive argument comparison.
+func parseJSONValue(_ json: String) -> JSONValue? {
+    guard let data = json.data(using: .utf8) else { return nil }
+    return try? JSONDecoder().decode(JSONValue.self, from: data)
+}
+
+/// Serves client-supplied tool results during replay.
+///
+/// Lookup order: exact `(name, arguments)` match (reusable — re-asking the same question
+/// gets the same answer instead of bouncing back to the client), then the first unconsumed
+/// result for the same tool name (the model may phrase arguments slightly differently on
+/// regeneration). No match → the call is new and must go to the client.
+final class ToolReplayCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private let results: [ReplayedToolResult]
+    private var consumed: Set<Int> = []
+
+    init(_ results: [ReplayedToolResult]) {
+        self.results = results
+    }
+
+    func result(name: String, arguments: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let parsed = parseJSONValue(arguments)
+        if let i = results.firstIndex(where: {
+            $0.name == name && (parseJSONValue($0.arguments).map { $0 == parsed } ?? ($0.arguments == arguments))
+        }) {
+            consumed.insert(i)
+            return results[i].output
+        }
+        if let i = results.indices.first(where: { !consumed.contains($0) && results[$0].name == name }) {
+            consumed.insert(i)
+            return results[i].output
+        }
+        return nil
+    }
+}
+
+/// Collects tool invocations that must be surfaced to the client. Shared by all
+/// `ProxyTool`s of one request so parallel calls are all reported, not just the first.
+final class ToolInvocationRecorder: @unchecked Sendable {
+    struct Invocation: Equatable {
+        let name: String
+        let arguments: String
+    }
+
+    private let lock = NSLock()
+    private var storage: [Invocation] = []
+
+    func record(name: String, arguments: String) {
+        lock.lock()
+        storage.append(.init(name: name, arguments: arguments))
+        lock.unlock()
+    }
+
+    var invocations: [Invocation] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
+func makeToolCallID() -> String {
+    "call_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24).lowercased()
 }
 
 #if canImport(FoundationModels)
@@ -318,6 +602,126 @@ func buildDynamicSchema(name: String, description: String?, schema: JSONValue) t
     }
 }
 
+// MARK: - Tool calls (FoundationModels bridge)
+
+/// Thrown by `ProxyTool.call` to abort generation when the model wants a tool the client
+/// must execute. FoundationModels wraps it in `LanguageModelSession.ToolCallError`.
+struct ProxyToolInvocation: Error {
+    let name: String
+    let arguments: String
+}
+
+/// Pass-through tool synthesized from an OpenAI tool definition.
+///
+/// FoundationModels executes tools in-process, but OpenAI tools are executed by the client.
+/// So `call` never does real work: it returns a client-supplied result when replaying a
+/// round-trip, and otherwise records the invocation and throws to stop generation.
+@available(macOS 26.0, *)
+struct ProxyTool: Tool {
+    typealias Arguments = GeneratedContent
+    typealias Output = String
+
+    let name: String
+    let description: String
+    let parameters: GenerationSchema
+    let replay: ToolReplayCache
+    let recorder: ToolInvocationRecorder
+
+    func call(arguments: GeneratedContent) async throws -> String {
+        let json = arguments.jsonString
+        if let cached = replay.result(name: name, arguments: json) {
+            return cached
+        }
+        recorder.record(name: name, arguments: json)
+        throw ProxyToolInvocation(name: name, arguments: json)
+    }
+}
+
+@available(macOS 26.0, *)
+func buildToolParametersSchema(_ tool: ChatCompletionRequest.ToolDefinition) throws -> GenerationSchema {
+    let schema = tool.function.parameters ?? .object(["type": .string("object"), "properties": .object([:])])
+    let root = try buildDynamicSchema(name: tool.function.name, description: nil, schema: schema)
+    do {
+        return try GenerationSchema(root: root, dependencies: [])
+    } catch {
+        throw Abort(
+            .badRequest,
+            reason: "Failed to build parameters schema for tool '\(tool.function.name)': \(error.localizedDescription)"
+        )
+    }
+}
+
+@available(macOS 26.0, *)
+func buildProxyTools(
+    _ tools: [ChatCompletionRequest.ToolDefinition],
+    replay: ToolReplayCache,
+    recorder: ToolInvocationRecorder
+) throws -> [ProxyTool] {
+    try tools.map { tool in
+        ProxyTool(
+            name: tool.function.name,
+            description: tool.function.description ?? "",
+            parameters: try buildToolParametersSchema(tool),
+            replay: replay,
+            recorder: recorder
+        )
+    }
+}
+
+/// Rebuilds prior turns (including completed tool round-trips) as a native `Transcript`,
+/// so the model sees real tool-call/tool-output entries rather than prose.
+@available(macOS 26.0, *)
+func buildTranscript(
+    instructions: String?,
+    tools: [ProxyTool],
+    history: [ChatCompletionRequest.Message]
+) throws -> Transcript {
+    func text(_ s: String) -> [Transcript.Segment] {
+        [.text(.init(content: s))]
+    }
+
+    var entries: [Transcript.Entry] = []
+    if instructions != nil || !tools.isEmpty {
+        entries.append(.instructions(.init(
+            segments: instructions.map(text) ?? [],
+            toolDefinitions: tools.map { Transcript.ToolDefinition(tool: $0) }
+        )))
+    }
+
+    var toolNamesByCallID: [String: String] = [:]
+    for msg in history {
+        switch msg.role {
+        case "user":
+            entries.append(.prompt(.init(segments: text(msg.content ?? ""))))
+        case "assistant":
+            if let content = msg.content, !content.isEmpty {
+                entries.append(.response(.init(assetIDs: [], segments: text(content))))
+            }
+            if let calls = msg.tool_calls, !calls.isEmpty {
+                let converted = try calls.map { call -> Transcript.ToolCall in
+                    toolNamesByCallID[call.id] = call.function.name
+                    let args: GeneratedContent
+                    do {
+                        args = try GeneratedContent(json: call.function.arguments.isEmpty ? "{}" : call.function.arguments)
+                    } catch {
+                        throw Abort(.badRequest, reason: "tool_calls[].function.arguments for '\(call.id)' is not valid JSON")
+                    }
+                    return .init(id: call.id, toolName: call.function.name, arguments: args)
+                }
+                entries.append(.toolCalls(.init(converted)))
+            }
+        case "tool":
+            let id = msg.tool_call_id ?? UUID().uuidString
+            let name = toolNamesByCallID[id] ?? msg.name ?? "unknown"
+            entries.append(.toolOutput(.init(id: id, toolName: name, segments: text(msg.content ?? ""))))
+        default:
+            // system/developer are already folded into `instructions`.
+            continue
+        }
+    }
+    return Transcript(entries: entries)
+}
+
 #endif
 
 // MARK: - Main Application
@@ -350,7 +754,8 @@ struct FoundationModelsProxy {
                     currentLocale: Locale.current.identifier,
                     currentLocaleSupported: model.supportsLocale(),
                     enUSSupported: model.supportsLocale(Locale(identifier: "en_US")),
-                    ruRUSupported: model.supportsLocale(Locale(identifier: "ru_RU"))
+                    ruRUSupported: model.supportsLocale(Locale(identifier: "ru_RU")),
+                    capabilities: .init(streaming: false, toolCalls: true, structuredOutput: true)
                 )
             }
             #endif
@@ -363,7 +768,8 @@ struct FoundationModelsProxy {
                 currentLocale: Locale.current.identifier,
                 currentLocaleSupported: nil,
                 enUSSupported: nil,
-                ruRUSupported: nil
+                ruRUSupported: nil,
+                capabilities: .init(streaming: false, toolCalls: false, structuredOutput: false)
             )
         }
 
@@ -381,12 +787,37 @@ struct FoundationModelsProxy {
             }
 
             let baseInstructions = systemInstructions(from: payload.messages)
-            let effectiveInstructions: String? = (formatType == "json_object")
+            var effectiveInstructions: String? = (formatType == "json_object")
                 ? augmentInstructionsForJSONObject(baseInstructions)
                 : baseInstructions
-            let prompt = renderPrompt(from: payload.messages)
 
-            var generatedText = "FoundationModels framework is not available or not supported on this OS version."
+            // Tools: validated up front so bad definitions are 400s, not generation errors.
+            let requestedTools = payload.tools ?? []
+            let toolChoice = try parseToolChoice(payload.tool_choice)
+            let activeTools = try selectTools(requestedTools, choice: toolChoice)
+            let conversation: ToolConversation? = requestedTools.isEmpty
+                ? nil
+                : try splitToolConversation(payload.messages)
+
+            if !activeTools.isEmpty, let directive = toolChoiceDirective(toolChoice) {
+                effectiveInstructions = [effectiveInstructions, directive]
+                    .compactMap { $0 }
+                    .joined(separator: "\n\n")
+            }
+
+            let prompt: String
+            if let conversation {
+                // Results for tools that aren't attached this turn can't be replayed via
+                // `ProxyTool`; hand them to the model as text instead.
+                let activeNames = Set(activeTools.map(\.function.name))
+                let unreplayable = conversation.pendingResults.filter { !activeNames.contains($0.name) }
+                prompt = appendToolResultsToPrompt(conversation.prompt, results: unreplayable)
+            } else {
+                prompt = renderPrompt(from: payload.messages)
+            }
+
+            var generatedText: String? = "FoundationModels framework is not available or not supported on this OS version."
+            var toolCalls: [ChatCompletionRequest.ToolCall]? = nil
             var finishReason = "stop"
 
             #if canImport(FoundationModels)
@@ -400,14 +831,24 @@ struct FoundationModelsProxy {
                     schema = nil
                 }
 
-                do {
-                    let session: LanguageModelSession
-                    if let effectiveInstructions {
-                        session = LanguageModelSession(instructions: effectiveInstructions)
-                    } else {
-                        session = LanguageModelSession()
-                    }
+                let recorder = ToolInvocationRecorder()
+                let session: LanguageModelSession
+                if let conversation {
+                    let replay = ToolReplayCache(conversation.pendingResults)
+                    let tools = try buildProxyTools(activeTools, replay: replay, recorder: recorder)
+                    let transcript = try buildTranscript(
+                        instructions: effectiveInstructions,
+                        tools: tools,
+                        history: conversation.history
+                    )
+                    session = LanguageModelSession(tools: tools, transcript: transcript)
+                } else if let effectiveInstructions {
+                    session = LanguageModelSession(instructions: effectiveInstructions)
+                } else {
+                    session = LanguageModelSession()
+                }
 
+                do {
                     if let schema {
                         let response = try await session.respond(to: prompt, schema: schema)
                         generatedText = response.content.jsonString
@@ -416,9 +857,20 @@ struct FoundationModelsProxy {
                         generatedText = response.content
                     }
                 } catch {
-                    app.logger.error("FoundationModels Error: \(error)")
-                    generatedText = "Error during generation: \(error.localizedDescription)"
-                    finishReason = "error"
+                    // `ProxyTool` aborts generation by throwing; the error arrives wrapped in
+                    // `ToolCallError`. The recorder is the source of truth for what was asked.
+                    let invocations = recorder.invocations
+                    if !invocations.isEmpty {
+                        toolCalls = invocations.map {
+                            .init(id: makeToolCallID(), type: "function", function: .init(name: $0.name, arguments: $0.arguments))
+                        }
+                        generatedText = nil
+                        finishReason = "tool_calls"
+                    } else {
+                        app.logger.error("FoundationModels Error: \(error)")
+                        generatedText = "Error during generation: \(error.localizedDescription)"
+                        finishReason = "error"
+                    }
                 }
             }
             #else
@@ -433,7 +885,7 @@ struct FoundationModelsProxy {
 
             let choice = ChatCompletionResponse.Choice(
                 index: 0,
-                message: .init(role: "assistant", content: generatedText),
+                message: .init(role: "assistant", content: generatedText, tool_calls: toolCalls),
                 finish_reason: finishReason
             )
 

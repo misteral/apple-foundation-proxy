@@ -17,9 +17,9 @@ Two endpoints, both on `127.0.0.1:8080`:
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET`  | `/health` | Reports `FoundationModels` import status, runtime availability, and which locales `SystemLanguageModel.default` supports on the host. |
-| `POST` | `/v1/chat/completions` | OpenAI-shaped request/response envelope. Generates text from `messages` via `LanguageModelSession`. Supports `response_format`. |
+| `POST` | `/v1/chat/completions` | OpenAI-shaped request/response envelope. Generates text from `messages` via `LanguageModelSession`. Supports `response_format` and `tools` / `tool_choice`. |
 
-The OpenAI compatibility covers text generation plus structured output (`response_format`). Missing on purpose for now: streaming, `tools` / `tool_choice`, `n > 1`, `logprobs`, multimodal content. `usage` is returned with zero counts because `FoundationModels` does not expose token usage.
+The OpenAI compatibility covers text generation, structured output (`response_format`), and client-executed tool calls (`tools` / `tool_choice`). Missing on purpose for now: streaming, `n > 1`, `logprobs`, multimodal content. `usage` is returned with zero counts because `FoundationModels` does not expose token usage.
 
 ## Request pipeline for `/v1/chat/completions`
 
@@ -28,10 +28,24 @@ The OpenAI compatibility covers text generation plus structured output (`respons
 3. **`augmentInstructionsForJSONObject`** — when `type == "json_object"`, append a "respond with JSON only" directive to the instructions. FoundationModels has no native JSON mode, so this is best-effort.
 4. **`renderPrompt`** — renders all `user`/`assistant` history as a labeled transcript and appends an empty `Assistant:` cue when the last turn is from the user. A single-user-message prompt is returned verbatim with no transcript framing.
 5. **`buildGenerationSchema`** (only when `type == "json_schema"`) — translates the JSON Schema fragment into a `DynamicGenerationSchema` and wraps it in a `GenerationSchema`. Schema construction errors surface as `400` (run before opening the session so they don't get swallowed by the generic catch).
-6. **`LanguageModelSession`** — a fresh session is created **per request**. Constructed with `instructions:` when those exist, otherwise with no instructions. No streaming, no conversation state across requests, no tools.
+6. **`LanguageModelSession`** — a fresh session is created **per request**. Constructed with `instructions:` when those exist, otherwise with no instructions. No streaming, no conversation state across requests.
 7. **Generate.** When a schema is present, call `respond(to:schema:)` and return `response.content.jsonString` as `choices[0].message.content`. Otherwise call `respond(to:)` and return the text response.
 
-History is prompt-stuffed rather than handed to a `Transcript` API because (a) the proxy is intentionally stateless and (b) the public surface of `Transcript` for arbitrary multi-turn rehydration hasn't been validated yet — see `docs/design-docs/openai-compatible-chat.md` for the forward-looking design.
+Without `tools`, history is prompt-stuffed (step 4). With `tools`, the pipeline switches to a native `Transcript` — see below.
+
+## Tool calls (`tools` / `tool_choice`)
+
+OpenAI tools are executed by the **client**; FoundationModels tools are executed **in-process** by the session. The bridge is a pass-through `ProxyTool` per OpenAI definition:
+
+1. **`parseToolChoice` + `selectTools`** — validate definitions (`type: "function"`, non-empty unique names) and apply `tool_choice`. `none` attaches no tools; a named function attaches only that tool. `required` / named function also add an instruction nudge (`toolChoiceDirective`) — FoundationModels cannot force a call.
+2. **`splitToolConversation`** — the latest `user` message is the prompt; everything before it is history; `tool` results *after* it are pending results of the in-flight turn.
+3. **`buildProxyTools`** — `function.parameters` goes through the same JSON Schema bridge as `response_format` (missing `parameters` = empty object). Unsupported schemas are `400`s.
+4. **`buildTranscript`** — history becomes native `Transcript` entries: instructions (with tool definitions), prompts, responses, `toolCalls`, `toolOutput`. The session is `LanguageModelSession(tools:transcript:)`.
+5. **Generate.** When the model calls a tool, `ProxyTool.call` either returns a pending client result from `ToolReplayCache` (replaying the round-trip), or records the call in `ToolInvocationRecorder` and throws `ProxyToolInvocation` to abort generation. Any non-empty recorder after a thrown error → response with `content: null`, `tool_calls`, `finish_reason: "tool_calls"`.
+
+Replay matching: exact `(name, arguments)` first (order-insensitive JSON compare, reusable), then the first unconsumed result with the same tool name. The fallback exists because regeneration may phrase arguments slightly differently. Pending results for tools not attached this turn (e.g. `tool_choice: "none"`) are appended to the prompt as text.
+
+Tool-call IDs are generated per response (`call_<24 hex>`); they are not stable across requests, which matches OpenAI.
 
 ## Supported JSON Schema subset (for `response_format.json_schema`)
 
@@ -70,6 +84,6 @@ On older toolchains, `/v1/chat/completions` returns a `[Mock Apple Intelligence 
 
 ## What this project is not
 
-- Not a full OpenAI emulator. The OpenAI shape is a calling convention; advanced features (streaming, tools, structured output, vision) are not implemented.
+- Not a full OpenAI emulator. The OpenAI shape is a calling convention; streaming, `n > 1`, `logprobs`, and vision are not implemented.
 - Not a chat assistant with memory. There is no server-side state across requests by design — clients send the full message history each turn.
 - Not production-ready as a network service. Local-only; see `docs/SECURITY.md`.

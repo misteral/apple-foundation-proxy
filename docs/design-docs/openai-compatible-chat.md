@@ -7,8 +7,9 @@ Implemented in `main.swift`:
 - `messages` translation (system/developer → instructions, user/assistant → prompt-stuffed transcript).
 - Per-request `LanguageModelSession`, single non-streaming response.
 - `response_format`: `text`, `json_object` (instruction-augmented), `json_schema` (JSON Schema → `DynamicGenerationSchema` → `GenerationSchema(root:dependencies:)` → `respond(to:schema:)` → `GeneratedContent.jsonString`).
+- `tools` + `tool_choice` (non-streaming): pass-through `ProxyTool` with sentinel throw, as designed below. Spike outcomes: `Transcript` *is* rich enough to rehydrate history (`.toolCalls` / `.toolOutput` entries, `LanguageModelSession(tools:transcript:)`), so tool requests use it instead of prompt stuffing. Round-trips after the latest user turn are replayed via `ToolReplayCache` because a session can only continue by responding to a prompt. Implementation notes live in `docs/ARCHITECTURE.md`.
 
-This doc covers what's still missing — streaming, tool calls — and the spike work needed before tackling them.
+This doc still covers what's missing — streaming (including the streaming tool-call variant) — and the spike work needed before tackling it.
 
 ## Endpoints
 
@@ -24,7 +25,7 @@ This doc covers what's still missing — streaming, tool calls — and the spike
 | `messages` (multi-turn) | Supported | `LanguageModelSession(transcript:)` rehydrated from prior turns; latest user message becomes the `Prompt` |
 | `system` / `developer` role | Supported | Concatenated into `Instructions` |
 | `stream: true` | Supported | `streamResponse(to:options:)` → SSE chunks |
-| `tools` + `tool_choice` | Supported via pass-through | Synthesized `ProxyTool` per OpenAI tool def; sentinel-throws on invocation, proxy translates to OpenAI `tool_calls` response |
+| `tools` + `tool_choice` | **Implemented** (non-streaming) via pass-through | Synthesized `ProxyTool` per OpenAI tool def; sentinel-throws on invocation, proxy translates to OpenAI `tool_calls` response |
 | `response_format: text` | Supported | Default `respond(to:options:)` → `Response<String>` |
 | `response_format: json_object` | Supported (best-effort) | Strong instructions only — FM has no native "json mode"; surface a warning if the model returns non-JSON |
 | `response_format: json_schema` | Supported | Translate JSON Schema → `GenerationSchema` at runtime, use `respond(to:schema:...)` → `GeneratedContent` → JSON |
