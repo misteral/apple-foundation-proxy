@@ -5,6 +5,10 @@ import Vapor
 import FoundationModels
 #endif
 
+#if canImport(NaturalLanguage)
+import NaturalLanguage
+#endif
+
 // MARK: - JSON value (for arbitrary JSON Schema fragments inside `response_format`)
 
 indirect enum JSONValue: Codable, Sendable, Equatable {
@@ -187,6 +191,13 @@ struct ChatCompletionRequest: Content {
     }
     let stream: Bool?
     let stream_options: StreamOptions?
+    /// OpenAI's response cap; `max_completion_tokens` is the newer name and wins if both are set.
+    let max_tokens: Int?
+    let max_completion_tokens: Int?
+    /// Sampling controls; validated by `samplingParameters(from:)`.
+    let temperature: Double?
+    let top_p: Double?
+    let seed: Int?
 }
 
 struct ChatCompletionResponse: Content {
@@ -215,10 +226,13 @@ struct ChatCompletionResponse: Content {
         let message: Message
         let finish_reason: String
     }
-    struct Usage: Content {
+    struct Usage: Content, Equatable {
         let prompt_tokens: Int
         let completion_tokens: Int
         let total_tokens: Int
+
+        /// Reported when token counting is unavailable (macOS < 26.4) or fails.
+        static let zero = Usage(prompt_tokens: 0, completion_tokens: 0, total_tokens: 0)
     }
     let id: String
     let object: String
@@ -237,12 +251,18 @@ struct HealthResponse: Content {
     let currentLocaleSupported: Bool?
     let enUSSupported: Bool?
     let ruRUSupported: Bool?
+    /// Language codes the on-device model supports (e.g. `en`, `de`, `zh`).
+    let supportedLanguages: [String]?
+    /// Context window in tokens (prompt + response).
+    let contextSize: Int?
     let capabilities: Capabilities
 
     struct Capabilities: Content {
         let streaming: Bool
         let toolCalls: Bool
         let structuredOutput: Bool
+        /// Real `usage` counts via `SystemLanguageModel.tokenCount` (macOS 26.4+).
+        let tokenCounting: Bool
     }
 }
 
@@ -283,6 +303,152 @@ struct ChatCompletionChunk: Content {
     let model: String
     let choices: [Choice]
     let usage: ChatCompletionResponse.Usage?
+}
+
+// MARK: - OpenAI-style errors
+
+/// A client-visible error with an OpenAI `error.code` (e.g. `context_length_exceeded`).
+struct ProxyAPIError: AbortError, Equatable {
+    let status: HTTPResponseStatus
+    let reason: String
+    let code: String?
+    var headers: HTTPHeaders = [:]
+
+    static func == (a: ProxyAPIError, b: ProxyAPIError) -> Bool {
+        a.status == b.status && a.reason == b.reason && a.code == b.code
+    }
+}
+
+/// OpenAI's error envelope: `{"error":{"message","type","param","code"}}`. OpenAI SDKs parse
+/// this into typed exceptions; Vapor's default `{"error":true,"reason":...}` they don't.
+struct OpenAIErrorBody: Content, Equatable {
+    struct Detail: Content, Equatable {
+        let message: String
+        let type: String
+        let param: String?
+        let code: String?
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(message, forKey: .message)
+            try c.encode(type, forKey: .type)
+            try c.encode(param, forKey: .param)
+            try c.encode(code, forKey: .code)
+        }
+    }
+    let error: Detail
+}
+
+func makeOpenAIErrorBody(status: HTTPResponseStatus, message: String, code: String?) -> OpenAIErrorBody {
+    let type: String
+    switch status.code {
+    case 429: type = "rate_limit_error"
+    case 400..<500: type = "invalid_request_error"
+    default: type = "server_error"
+    }
+    return OpenAIErrorBody(error: .init(message: message, type: type, param: nil, code: code))
+}
+
+/// Replaces Vapor's `ErrorMiddleware` so every error (validation 400s, decoding errors, model
+/// failures) leaves the server in OpenAI's error shape.
+struct OpenAIErrorMiddleware: AsyncMiddleware {
+    func respond(to request: Request, chainingTo next: AsyncResponder) async throws -> Response {
+        do {
+            return try await next.respond(to: request)
+        } catch {
+            let status: HTTPResponseStatus
+            let message: String
+            var code: String? = nil
+            var headers = HTTPHeaders()
+            switch error {
+            case let apiError as ProxyAPIError:
+                status = apiError.status
+                message = apiError.reason
+                code = apiError.code
+                headers = apiError.headers
+            case let abort as AbortError:
+                status = abort.status
+                message = abort.reason
+                headers = abort.headers
+            default:
+                status = .internalServerError
+                message = "Internal server error"
+            }
+            if status.code >= 500 {
+                request.logger.error("\(status.code): \(error)")
+            } else {
+                request.logger.warning("\(status.code): \(message)")
+            }
+            let response = Response(status: status, headers: headers)
+            try response.content.encode(makeOpenAIErrorBody(status: status, message: message, code: code))
+            return response
+        }
+    }
+}
+
+// MARK: - Language detection
+
+/// Below this many letters, NaturalLanguage guesses are noise ("hi" → Catalan, "ok" → Polish).
+let languageDetectionMinimumLetters = 20
+let languageDetectionMinimumConfidence = 0.8
+
+/// Best-effort dominant language of `text` as a BCP-47 code (`en`, `ru`, `zh-Hans`), or nil
+/// when the text is too short or the guess isn't confident.
+///
+/// Recognition is deliberately unconstrained: restricting it to the model's supported set
+/// would force e.g. Russian into some Latin language and hide exactly what we want to flag.
+func detectLanguage(in text: String) -> String? {
+    #if canImport(NaturalLanguage)
+    guard text.filter(\.isLetter).count >= languageDetectionMinimumLetters else { return nil }
+    let recognizer = NLLanguageRecognizer()
+    recognizer.processString(text)
+    guard let (language, confidence) = recognizer.languageHypotheses(withMaximum: 1).first,
+          confidence >= languageDetectionMinimumConfidence else { return nil }
+    return language.rawValue
+    #else
+    return nil
+    #endif
+}
+
+/// `zh-Hans` → `zh`, `pt-BR` → `pt`.
+func baseLanguageCode(_ identifier: String) -> String? {
+    Locale.Language(identifier: identifier).languageCode?.identifier
+}
+
+func isLanguageSupported(_ detected: String, supportedCodes: Set<String>) -> Bool {
+    guard let code = baseLanguageCode(detected) else { return true }
+    return supportedCodes.contains(code)
+}
+
+let detectedLanguageHeader = "X-AFP-Detected-Language"
+let languageSupportedHeader = "X-AFP-Language-Supported"
+
+/// The language signal is advisory: unsupported languages (e.g. Russian) still get an
+/// answer, just a possibly weaker one, so the proxy reports instead of rejecting.
+func languageHeaders(detected: String?, supported: Bool?) -> HTTPHeaders {
+    var headers = HTTPHeaders()
+    guard let detected else { return headers }
+    headers.replaceOrAdd(name: detectedLanguageHeader, value: detected)
+    if let supported {
+        headers.replaceOrAdd(name: languageSupportedHeader, value: supported ? "true" : "false")
+    }
+    return headers
+}
+
+/// Re-throws any error as a `ProxyAPIError` carrying `extraHeaders`, so headers decided
+/// before the failure (the language signal) also reach error responses.
+func attachingHeaders(_ extraHeaders: HTTPHeaders, to error: Error) -> Error {
+    guard !extraHeaders.isEmpty else { return error }
+    var apiError: ProxyAPIError
+    switch error {
+    case let e as ProxyAPIError: apiError = e
+    case let e as AbortError: apiError = ProxyAPIError(status: e.status, reason: e.reason, code: nil, headers: e.headers)
+    default: return error
+    }
+    for (name, value) in extraHeaders {
+        apiError.headers.replaceOrAdd(name: name, value: value)
+    }
+    return apiError
 }
 
 // MARK: - Prompt assembly
@@ -609,9 +775,23 @@ struct PreparedCompletion {
     let stream: Bool
     let includeUsage: Bool
     let model: String
+    /// `detectLanguage` of the latest user message; nil when unknown.
+    let detectedLanguage: String?
+    /// Client-requested response cap; nil when not given. See `responseTokenBudget`.
+    let maxTokens: Int?
+    let sampling: SamplingParameters
 }
 
 func prepareCompletion(_ payload: ChatCompletionRequest) throws -> PreparedCompletion {
+    guard let lastUser = payload.messages.last(where: { $0.role == "user" }) else {
+        throw Abort(.badRequest, reason: "messages must contain at least one 'user' message")
+    }
+    let maxTokens = payload.max_completion_tokens ?? payload.max_tokens
+    if let maxTokens, maxTokens < 1 {
+        throw Abort(.badRequest, reason: "max_tokens / max_completion_tokens must be at least 1")
+    }
+    let sampling = try samplingParameters(from: payload)
+
     let format = payload.response_format
     let formatType = format?.type ?? "text"
     guard ["text", "json_object", "json_schema"].contains(formatType) else {
@@ -639,11 +819,11 @@ func prepareCompletion(_ payload: ChatCompletionRequest) throws -> PreparedCompl
 
     let prompt: String
     if let conversation {
-        // Results for tools that aren't attached this turn can't be replayed via
-        // `ProxyTool`; hand them to the model as text instead.
-        let activeNames = Set(activeTools.map(\.function.name))
-        let unreplayable = conversation.pendingResults.filter { !activeNames.contains($0.name) }
-        prompt = appendToolResultsToPrompt(conversation.prompt, results: unreplayable)
+        // Pending results go into the prompt as text *and* are replayed through
+        // `ProxyTool`. Replay alone loses them if the model answers without calling the
+        // tool again; text alone loses the native tool-output framing. With both, the
+        // result reaches the model either way.
+        prompt = appendToolResultsToPrompt(conversation.prompt, results: conversation.pendingResults)
     } else {
         prompt = renderPrompt(from: payload.messages)
     }
@@ -657,18 +837,104 @@ func prepareCompletion(_ payload: ChatCompletionRequest) throws -> PreparedCompl
         conversation: conversation,
         stream: payload.stream == true,
         includeUsage: payload.stream_options?.include_usage == true,
-        model: payload.model ?? "apple-foundation-model"
+        model: payload.model ?? "apple-foundation-model",
+        detectedLanguage: lastUser.content.flatMap(detectLanguage(in:)),
+        maxTokens: maxTokens,
+        sampling: sampling
     )
+}
+
+// MARK: - Sampling
+
+/// OpenAI sampling controls, validated against OpenAI's ranges. FoundationModels rejects
+/// some out-of-range values mid-generation (a `top_p` above 1 fails with an opaque
+/// error), so they're refused up front with a clear 400.
+struct SamplingParameters: Equatable {
+    var temperature: Double? = nil
+    /// OpenAI `top_p` → nucleus sampling (`SamplingMode.random(probabilityThreshold:)`).
+    var topP: Double? = nil
+    var seed: UInt64? = nil
+
+    enum Mode: Equatable {
+        case greedy
+        case nucleus(threshold: Double, seed: UInt64?)
+    }
+
+    /// How tokens get picked; nil keeps the model's default sampling.
+    /// `top_p: 0` means "only the top token", which is greedy. `top_p: 1` without a seed
+    /// is the default. A seed needs random sampling to apply to, so a seed alone becomes
+    /// nucleus sampling over the full distribution.
+    var mode: Mode? {
+        switch (topP, seed) {
+        case (0?, _): return .greedy
+        case (nil, nil), (1?, nil): return nil
+        case let (topP, seed): return .nucleus(threshold: topP ?? 1, seed: seed)
+        }
+    }
+}
+
+func samplingParameters(from payload: ChatCompletionRequest) throws -> SamplingParameters {
+    if let t = payload.temperature, !(0...2).contains(t) {
+        throw Abort(.badRequest, reason: "temperature must be between 0 and 2")
+    }
+    if let p = payload.top_p, !(0...1).contains(p) {
+        throw Abort(.badRequest, reason: "top_p must be between 0 and 1")
+    }
+    // OpenAI seeds are signed 64-bit; keep every value distinct.
+    let seed = payload.seed.map { UInt64(bitPattern: Int64($0)) }
+    return SamplingParameters(temperature: payload.temperature, topP: payload.top_p, seed: seed)
+}
+
+// MARK: - Response token budget
+
+/// Headroom kept free in the context window. FoundationModels' real limit sits below the
+/// nominal `contextSize`. Measured on macOS 26.6 with a 2960-token prompt: a cap leaving 16
+/// tokens free still failed ("4091 tokens exceeds 4096"), while 128 free reached the cap
+/// cleanly (transcript total 3969).
+let responseTokenMargin = 128
+
+/// The response cap for one request: the client's `max_tokens`, clamped to what's left of the
+/// context window after the prompt. Without a cap, FoundationModels generates until the window
+/// fills and only then throws `exceededContextWindowSize`, so a runaway reply to a short prompt
+/// would surface as a misleading "context length exceeded". With the cap it ends as
+/// `finish_reason: "length"`. A prompt that leaves no room at all is a 400 up front.
+func responseTokenBudget(requested: Int?, promptTokens: Int, contextSize: Int) throws -> Int {
+    let remaining = contextSize - promptTokens - responseTokenMargin
+    guard remaining > 0 else {
+        throw ProxyAPIError(
+            status: .badRequest,
+            reason: "Content contains \(promptTokens) tokens, which leaves no room for a response within the maximum context size of \(contextSize).",
+            code: "context_length_exceeded"
+        )
+    }
+    return min(requested ?? remaining, remaining)
+}
+
+/// `length` when generation used the whole budget. FoundationModels truncates silently at
+/// `maximumResponseTokens`, so the token count is the only signal. Re-tokenizing the output
+/// can land one token off the generated count at the boundary (cap 1008 → counted 1007),
+/// hence the 1-token tolerance.
+func finishReason(completionTokens: Int, budget: Int?) -> String {
+    if let budget, completionTokens + 1 >= budget {
+        return "length"
+    }
+    return "stop"
 }
 
 /// Result of one generation, independent of how it's delivered (JSON or SSE).
 struct CompletionOutcome: Equatable {
     let content: String?
     let toolCalls: [ToolInvocationRecorder.Invocation]
-    let finishReason: String
+    var finishReason: String
+    var usage: ChatCompletionResponse.Usage = .zero
 
     static func text(_ content: String, finishReason: String = "stop") -> CompletionOutcome {
         .init(content: content, toolCalls: [], finishReason: finishReason)
+    }
+
+    /// The model-generated part, for counting completion tokens.
+    var completionText: String {
+        content ?? toolCalls.map { "\($0.name)(\($0.arguments))" }.joined(separator: "\n")
     }
 }
 
@@ -704,9 +970,7 @@ func makeCompletionResponse(
             message: .init(role: "assistant", content: outcome.content, tool_calls: toolCalls),
             finish_reason: outcome.finishReason
         )],
-        // FoundationModels does not expose token counts; report zeros so clients that
-        // require the `usage` field don't fail to decode the response.
-        usage: .init(prompt_tokens: 0, completion_tokens: 0, total_tokens: 0)
+        usage: outcome.usage
     )
 }
 
@@ -770,15 +1034,15 @@ struct ChunkFactory {
 
     func finish(_ reason: String) -> ChatCompletionChunk { chunk(.init(), finish: reason) }
 
-    /// `stream_options.include_usage` trailer: empty `choices`, zeroed usage (see `Usage`).
-    func usage() -> ChatCompletionChunk {
+    /// `stream_options.include_usage` trailer: empty `choices`, then usage.
+    func usage(_ usage: ChatCompletionResponse.Usage) -> ChatCompletionChunk {
         ChatCompletionChunk(
             id: id,
             object: "chat.completion.chunk",
             created: created,
             model: model,
             choices: [],
-            usage: .init(prompt_tokens: 0, completion_tokens: 0, total_tokens: 0)
+            usage: usage
         )
     }
 }
@@ -792,6 +1056,13 @@ extension AsyncBodyStreamWriter {
         try await writeBuffer(ByteBuffer(string: sseDone))
     }
 
+    /// Mid-stream failure: HTTP status is already 200, so the error travels as an OpenAI
+    /// error event, which OpenAI SDKs raise as an `APIError`.
+    func writeSSEError(_ error: ProxyAPIError) async throws {
+        let body = makeOpenAIErrorBody(status: error.status, message: error.reason, code: error.code)
+        try await writeBuffer(ByteBuffer(string: try sseEvent(body)))
+    }
+
     /// Writes an outcome's content and tool calls as chunks (not the finish chunk).
     func writeOutcomeTail(_ outcome: CompletionOutcome, chunks: ChunkFactory) async throws {
         if let content = outcome.content, !content.isEmpty {
@@ -803,19 +1074,27 @@ extension AsyncBodyStreamWriter {
     }
 }
 
+/// How a streamed generation ended. `nil` from a generator means it already wrote an error
+/// event, so there's no finish chunk or usage.
+struct StreamEnd {
+    let finishReason: String
+    let usage: ChatCompletionResponse.Usage
+}
+
 /// Wraps a generator in an OpenAI-shaped SSE response: role chunk, whatever `generate`
-/// writes, a finish chunk with the reason it returns, an optional usage trailer, `[DONE]`.
+/// writes, a finish chunk, an optional usage trailer, `[DONE]`.
 func makeSSEResponse(
     chunks: ChunkFactory,
     includeUsage: Bool,
-    generate: @escaping @Sendable (AsyncBodyStreamWriter) async throws -> String
+    generate: @escaping @Sendable (AsyncBodyStreamWriter) async throws -> StreamEnd?
 ) -> Response {
     let body = Response.Body(managedAsyncStream: { writer in
         try await writer.writeSSE(chunks.role())
-        let finishReason = try await generate(writer)
-        try await writer.writeSSE(chunks.finish(finishReason))
-        if includeUsage {
-            try await writer.writeSSE(chunks.usage())
+        if let end = try await generate(writer) {
+            try await writer.writeSSE(chunks.finish(end.finishReason))
+            if includeUsage {
+                try await writer.writeSSE(chunks.usage(end.usage))
+            }
         }
         try await writer.writeSSEDone()
     })
@@ -1081,6 +1360,18 @@ struct CompletionSession {
     let session: LanguageModelSession
     let schema: GenerationSchema?
     let recorder: ToolInvocationRecorder
+    let sampling: SamplingParameters
+    /// Response cap passed to the model; set by `applyResponseBudget`.
+    var responseBudget: Int? = nil
+
+    var options: GenerationOptions {
+        let mode: GenerationOptions.SamplingMode? = switch sampling.mode {
+        case nil: nil
+        case .greedy: .greedy
+        case let .nucleus(threshold, seed): .random(probabilityThreshold: threshold, seed: seed)
+        }
+        return GenerationOptions(sampling: mode, temperature: sampling.temperature, maximumResponseTokens: responseBudget)
+    }
 }
 
 /// Builds the schema, tools and transcript, then opens the session. Throws `Abort(400)` on
@@ -1105,48 +1396,157 @@ func makeCompletionSession(_ prepared: PreparedCompletion) throws -> CompletionS
     } else {
         session = LanguageModelSession()
     }
-    return CompletionSession(session: session, schema: schema, recorder: recorder)
+    return CompletionSession(session: session, schema: schema, recorder: recorder, sampling: prepared.sampling)
 }
 
-/// Maps a generation error to an OpenAI `finish_reason`. Safety blocks become the standard
-/// `content_filter`. Everything else stays `error`, which is non-standard but keeps the
-/// existing 200-with-explanation contract; see `docs/ARCHITECTURE.md`.
+/// Maps a FoundationModels failure to a client-visible HTTP error, or `nil` for safety
+/// blocks, which OpenAI reports as a normal reply with `finish_reason: "content_filter"`.
 @available(macOS 26.0, *)
-func finishReason(for error: Error) -> String {
-    if let generationError = error as? LanguageModelSession.GenerationError {
-        switch generationError {
-        case .guardrailViolation, .refusal:
-            return "content_filter"
-        default:
-            return "error"
-        }
+func apiError(for error: Error) -> ProxyAPIError? {
+    guard let generationError = error as? LanguageModelSession.GenerationError else {
+        return ProxyAPIError(status: .internalServerError, reason: error.localizedDescription, code: "generation_failed")
     }
-    return "error"
+    // The context's debug description is the specific one ("Content contains 5907 tokens,
+    // which exceeds ... 4096."); `localizedDescription` is a generic sentence.
+    let message = generationErrorContext(generationError)?.debugDescription ?? error.localizedDescription
+    switch generationError {
+    case .guardrailViolation, .refusal:
+        return nil
+    case .exceededContextWindowSize:
+        return ProxyAPIError(status: .badRequest, reason: message, code: "context_length_exceeded")
+    case .unsupportedLanguageOrLocale:
+        return ProxyAPIError(status: .badRequest, reason: message, code: "unsupported_language")
+    case .unsupportedGuide:
+        return ProxyAPIError(status: .badRequest, reason: message, code: "unsupported_schema")
+    case .rateLimited, .concurrentRequests:
+        return ProxyAPIError(status: .tooManyRequests, reason: message, code: "rate_limit_exceeded")
+    case .assetsUnavailable:
+        return ProxyAPIError(status: .serviceUnavailable, reason: message, code: "model_unavailable")
+    case .decodingFailure:
+        return ProxyAPIError(status: .internalServerError, reason: message, code: "generation_failed")
+    @unknown default:
+        return ProxyAPIError(status: .internalServerError, reason: message, code: "generation_failed")
+    }
 }
 
-/// Turns a failed generation into an outcome. A recorded invocation means `ProxyTool`
-/// aborted generation on purpose; the error arrives wrapped in `ToolCallError`, but the
-/// recorder is the source of truth for what was asked.
 @available(macOS 26.0, *)
-func failureOutcome(_ error: Error, recorder: ToolInvocationRecorder, logger: Logger) -> CompletionOutcome {
+func generationErrorContext(_ error: LanguageModelSession.GenerationError) -> LanguageModelSession.GenerationError.Context? {
+    switch error {
+    case .exceededContextWindowSize(let c), .assetsUnavailable(let c), .guardrailViolation(let c),
+         .unsupportedGuide(let c), .unsupportedLanguageOrLocale(let c), .decodingFailure(let c),
+         .rateLimited(let c), .concurrentRequests(let c), .refusal(_, let c):
+        return c
+    @unknown default:
+        return nil
+    }
+}
+
+/// Turns a failed generation into an outcome, or throws the client-visible error.
+/// A recorded invocation means `ProxyTool` aborted generation on purpose. The error arrives
+/// wrapped in `ToolCallError`, but the recorder is the source of truth for what was asked.
+@available(macOS 26.0, *)
+func failureOutcome(_ error: Error, recorder: ToolInvocationRecorder, logger: Logger) throws -> CompletionOutcome {
     let invocations = recorder.invocations
     if !invocations.isEmpty {
         return .init(content: nil, toolCalls: invocations, finishReason: "tool_calls")
     }
-    logger.error("FoundationModels Error: \(error)")
-    return .text("Error during generation: \(error.localizedDescription)", finishReason: finishReason(for: error))
+    guard let apiError = apiError(for: error) else {
+        logger.warning("Generation blocked by safety guardrails: \(error)")
+        return .init(content: nil, toolCalls: [], finishReason: "content_filter")
+    }
+    throw apiError
+}
+
+/// Real token usage from the model's own tokenizer (macOS 26.4+; zeros below or on failure).
+///
+/// `prompt_tokens` counts the session transcript through the latest prompt entry: the
+/// instructions, tool definitions, history and prompt. `completion_tokens` counts what the
+/// model produced this turn (text, or tool-call names and arguments). Entries replayed after
+/// the prompt aren't counted, so on tool round-trips the numbers are a close lower bound.
+@available(macOS 26.0, *)
+func measureUsage(_ cs: CompletionSession, outcome: CompletionOutcome) async -> ChatCompletionResponse.Usage {
+    guard #available(macOS 26.4, *) else { return .zero }
+    let model = SystemLanguageModel.default
+    let entries = Array(cs.session.transcript)
+    let lastPrompt = entries.lastIndex { entry in
+        if case .prompt = entry { return true }
+        return false
+    }
+    let promptEntries = lastPrompt.map { Array(entries[...$0]) } ?? entries
+    guard let promptTokens = try? await model.tokenCount(for: promptEntries) else { return .zero }
+    let text = outcome.completionText
+    var completionTokens = 0
+    if !text.isEmpty {
+        // `tokenCount(for: String)` wraps the text as a prompt, which adds a fixed framing
+        // overhead (8 tokens on macOS 26.6). Subtract the empty-string baseline so
+        // `completion_tokens` counts only the generated content.
+        async let raw = try? model.tokenCount(for: text)
+        async let baseline = try? model.tokenCount(for: "")
+        if let raw = await raw, let baseline = await baseline {
+            completionTokens = max(raw - baseline, 0)
+        }
+    }
+    return .init(
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: promptTokens + completionTokens
+    )
+}
+
+/// Sets the session's response cap (`responseTokenBudget`). On macOS 26.4+ it counts the
+/// prompt with the model's tokenizer, which also rejects prompts that can't fit before any
+/// generation or stream starts. Below 26.4 there's no tokenizer, so only the client's
+/// `max_tokens` is applied.
+@available(macOS 26.0, *)
+func applyResponseBudget(_ cs: CompletionSession, prompt: String, requested: Int?) async throws -> CompletionSession {
+    var budgeted = cs
+    guard #available(macOS 26.4, *) else {
+        budgeted.responseBudget = requested
+        return budgeted
+    }
+    let model = SystemLanguageModel.default
+    guard let historyTokens = try? await model.tokenCount(for: cs.session.transcript),
+          let promptTokens = try? await model.tokenCount(for: prompt) else {
+        budgeted.responseBudget = requested
+        return budgeted
+    }
+    budgeted.responseBudget = try responseTokenBudget(
+        requested: requested,
+        promptTokens: historyTokens + promptTokens,
+        contextSize: model.contextSize
+    )
+    return budgeted
+}
+
+/// Fills in usage and, for a normal stop, whether the budget cut the reply short.
+@available(macOS 26.0, *)
+func finalize(_ outcome: CompletionOutcome, _ cs: CompletionSession) async -> CompletionOutcome {
+    var final = outcome
+    final.usage = await measureUsage(cs, outcome: outcome)
+    if final.finishReason == "stop", final.usage != .zero {
+        final.finishReason = finishReason(completionTokens: final.usage.completion_tokens, budget: cs.responseBudget)
+    }
+    return final
 }
 
 @available(macOS 26.0, *)
-func generateCompletion(_ cs: CompletionSession, prompt: String, logger: Logger) async -> CompletionOutcome {
+func generateCompletion(_ cs: CompletionSession, prompt: String, logger: Logger) async throws -> CompletionOutcome {
+    var outcome: CompletionOutcome
     do {
         if let schema = cs.schema {
-            return .text(try await cs.session.respond(to: prompt, schema: schema).content.jsonString)
+            outcome = .text(try await cs.session.respond(to: prompt, schema: schema, options: cs.options).content.jsonString)
+        } else {
+            outcome = .text(try await cs.session.respond(to: prompt, options: cs.options).content)
         }
-        return .text(try await cs.session.respond(to: prompt).content)
     } catch {
-        return failureOutcome(error, recorder: cs.recorder, logger: logger)
+        outcome = try failureOutcome(error, recorder: cs.recorder, logger: logger)
     }
+    return await finalize(outcome, cs)
+}
+
+@available(macOS 26.0, *)
+func supportedLanguageCodes() -> Set<String> {
+    Set(SystemLanguageModel.default.supportedLanguages.compactMap { $0.languageCode?.identifier })
 }
 
 /// Wraps a failed SSE write (client went away) so the streaming `catch` doesn't mistake it
@@ -1171,25 +1571,33 @@ func makeStreamingCompletion(
                 throw StreamWriteFailed(underlying: error)
             }
         }
+        func end(_ outcome: CompletionOutcome) async -> StreamEnd {
+            // Counting (~20 ms a call) is needed for usage and to tell `length` from `stop`.
+            guard includeUsage || cs.responseBudget != nil else {
+                return StreamEnd(finishReason: outcome.finishReason, usage: .zero)
+            }
+            let final = await finalize(outcome, cs)
+            return StreamEnd(finishReason: final.finishReason, usage: final.usage)
+        }
 
         do {
             if let schema = cs.schema {
                 // Partial `GeneratedContent` snapshots re-serialize with closing braces in
                 // different places, so they aren't prefix-stable JSON. Structured output is
                 // generated in full and sent as a single content chunk.
-                let response = try await cs.session.respond(to: prompt, schema: schema)
-                try await send(chunks.content(response.content.jsonString))
-            } else {
-                var previous = ""
-                for try await snapshot in cs.session.streamResponse(to: prompt) {
-                    let delta = streamDelta(previous: previous, current: snapshot.content)
-                    previous = snapshot.content
-                    if !delta.isEmpty {
-                        try await send(chunks.content(delta))
-                    }
+                let json = try await cs.session.respond(to: prompt, schema: schema, options: cs.options).content.jsonString
+                try await send(chunks.content(json))
+                return await end(.text(json))
+            }
+            var previous = ""
+            for try await snapshot in cs.session.streamResponse(to: prompt, options: cs.options) {
+                let delta = streamDelta(previous: previous, current: snapshot.content)
+                previous = snapshot.content
+                if !delta.isEmpty {
+                    try await send(chunks.content(delta))
                 }
             }
-            return "stop"
+            return await end(.text(previous))
         } catch let failure as StreamWriteFailed {
             // Rethrowing ends the managed stream; leaving the `for await` loop drops the
             // response stream.
@@ -1197,9 +1605,15 @@ func makeStreamingCompletion(
             throw failure.underlying
         } catch {
             // Text streamed before a tool call or failure stays sent.
-            let outcome = failureOutcome(error, recorder: cs.recorder, logger: logger)
-            try await writer.writeOutcomeTail(outcome, chunks: chunks)
-            return outcome.finishReason
+            do {
+                let outcome = try failureOutcome(error, recorder: cs.recorder, logger: logger)
+                try await writer.writeOutcomeTail(outcome, chunks: chunks)
+                return await end(outcome)
+            } catch let apiError as ProxyAPIError {
+                logger.error("FoundationModels error mid-stream: \(error)")
+                try await writer.writeSSEError(apiError)
+                return nil
+            }
         }
     }
 }
@@ -1225,6 +1639,11 @@ struct FoundationModelsProxy {
         // Vapor's 16 KB default rejects (413) ordinary agent traffic: tool schemas plus a
         // few tool results in the history go past it quickly.
         app.routes.defaultMaxBodySize = "4mb"
+        // Same stack as Vapor's default, with the error middleware swapped for one that
+        // speaks OpenAI's error format.
+        app.middleware = Middlewares()
+        app.middleware.use(RouteLoggingMiddleware(logLevel: .info))
+        app.middleware.use(OpenAIErrorMiddleware())
         app.logger.info("Starting Apple FoundationModels proxy on http://127.0.0.1:8080")
 
         app.get("health") { _ -> HealthResponse in
@@ -1240,7 +1659,14 @@ struct FoundationModelsProxy {
                     currentLocaleSupported: model.supportsLocale(),
                     enUSSupported: model.supportsLocale(Locale(identifier: "en_US")),
                     ruRUSupported: model.supportsLocale(Locale(identifier: "ru_RU")),
-                    capabilities: .init(streaming: true, toolCalls: true, structuredOutput: true)
+                    supportedLanguages: supportedLanguageCodes().sorted(),
+                    contextSize: model.contextSize,
+                    capabilities: .init(
+                        streaming: true,
+                        toolCalls: true,
+                        structuredOutput: true,
+                        tokenCounting: { if #available(macOS 26.4, *) { return true } else { return false } }()
+                    )
                 )
             }
             #endif
@@ -1254,7 +1680,9 @@ struct FoundationModelsProxy {
                 currentLocaleSupported: nil,
                 enUSSupported: nil,
                 ruRUSupported: nil,
-                capabilities: .init(streaming: false, toolCalls: false, structuredOutput: false)
+                supportedLanguages: nil,
+                contextSize: nil,
+                capabilities: .init(streaming: false, toolCalls: false, structuredOutput: false, tokenCounting: false)
             )
         }
 
@@ -1269,17 +1697,46 @@ struct FoundationModelsProxy {
             let outcome: CompletionOutcome
             #if canImport(FoundationModels)
             if #available(macOS 26.0, *) {
-                let cs = try makeCompletionSession(prepared)
-                if prepared.stream {
-                    return makeStreamingCompletion(
-                        cs,
-                        prompt: prepared.prompt,
-                        chunks: chunks,
-                        includeUsage: prepared.includeUsage,
-                        logger: app.logger
-                    )
+                let languageSupported = prepared.detectedLanguage.map {
+                    isLanguageSupported($0, supportedCodes: supportedLanguageCodes())
                 }
-                outcome = await generateCompletion(cs, prompt: prepared.prompt, logger: app.logger)
+                if let detected = prepared.detectedLanguage, languageSupported == false {
+                    // `notice`, not `warning`: it fires on every request in that language.
+                    app.logger.notice("Prompt language '\(detected)' is not supported by the on-device model; output quality may be degraded.")
+                }
+
+                let extraHeaders = languageHeaders(detected: prepared.detectedLanguage, supported: languageSupported)
+                do {
+                    let cs = try await applyResponseBudget(
+                        try makeCompletionSession(prepared),
+                        prompt: prepared.prompt,
+                        requested: prepared.maxTokens
+                    )
+                    let response: Response
+                    if prepared.stream {
+                        response = makeStreamingCompletion(
+                            cs,
+                            prompt: prepared.prompt,
+                            chunks: chunks,
+                            includeUsage: prepared.includeUsage,
+                            logger: app.logger
+                        )
+                    } else {
+                        let generated = try await generateCompletion(cs, prompt: prepared.prompt, logger: app.logger)
+                        response = try await makeCompletionResponse(
+                            generated,
+                            id: completionID,
+                            created: created,
+                            model: prepared.model
+                        ).encodeResponse(for: req)
+                    }
+                    for (name, value) in extraHeaders {
+                        response.headers.replaceOrAdd(name: name, value: value)
+                    }
+                    return response
+                } catch {
+                    throw attachingHeaders(extraHeaders, to: error)
+                }
             } else {
                 outcome = unavailableCompletionOutcome
             }
@@ -1288,12 +1745,11 @@ struct FoundationModelsProxy {
             outcome = mockCompletionOutcome(prepared)
             #endif
 
+            // Reached on the mock build and on pre-macOS-26 runtimes.
             if prepared.stream {
-                // Reached on the mock build and on pre-macOS-26 runtimes: stream the fixed
-                // outcome so streaming clients still get a well-formed reply.
                 return makeSSEResponse(chunks: chunks, includeUsage: prepared.includeUsage) { writer in
                     try await writer.writeOutcomeTail(outcome, chunks: chunks)
-                    return outcome.finishReason
+                    return StreamEnd(finishReason: outcome.finishReason, usage: outcome.usage)
                 }
             }
             return try await makeCompletionResponse(

@@ -22,4 +22,4 @@ This is a feature, not technical debt. Keep it.
 
 ## 4. The OpenAI shape is a calling convention, not a contract
 
-Clients use OpenAI shapes because their HTTP plumbing already understands them — that is the only reason this server speaks them. Do not feel obligated to grow into a full OpenAI emulator (streaming, function calling, vision, real `usage` token counts). Add fields when a real client needs them; otherwise leave the response minimal.
+Clients use OpenAI shapes because their HTTP plumbing already understands them — that is the only reason this server speaks them. Do not feel obligated to grow into a full OpenAI emulator (vision, `n > 1`, `logprobs`; streaming, function calling and real `usage` were added only because real clients needed them). Add fields when a real client needs them; otherwise leave the response minimal.

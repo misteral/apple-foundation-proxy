@@ -42,4 +42,4 @@ The only external dependency is Vapor. `Package.resolved` is committed. Adding a
 
 ## Comments
 
-Comments in `main.swift` exist where the *why* is non-obvious — the macOS 26 gating, the mock fallback, why `usage` token counts are zero. Don't add comments that restate code; do add comments when you encode an invariant a future agent might "clean up."
+Comments in `main.swift` exist where the *why* is non-obvious — the macOS 26 / 26.4 gating, the mock fallback, the tokenizer's framing overhead. Don't add comments that restate code; do add comments when you encode an invariant a future agent might "clean up."

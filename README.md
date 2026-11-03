@@ -39,7 +39,10 @@ Example:
   "currentLocale": "en_GE",
   "currentLocaleSupported": true,
   "enUSSupported": true,
-  "ruRUSupported": false
+  "ruRUSupported": false,
+  "supportedLanguages": ["da", "de", "en", "es", "fr", "it", "ja", "ko", "nb", "nl", "pt", "sv", "tr", "vi", "zh"],
+  "contextSize": 4096,
+  "capabilities": {"streaming": true, "toolCalls": true, "structuredOutput": true, "tokenCounting": true}
 }
 ```
 
@@ -113,7 +116,7 @@ Tool `parameters` use the same JSON Schema subset as `response_format.json_schem
 
 ### Streaming
 
-`"stream": true` returns OpenAI-style server-sent events (`chat.completion.chunk` deltas, then `data: [DONE]`). `stream_options.include_usage` adds a final usage chunk (zeros). Tools work in streaming mode too: a tool call ends the stream with a `tool_calls` delta and `finish_reason: "tool_calls"`. With `json_schema`, the JSON arrives in one chunk. Chunks are as coarse as FoundationModels' snapshots, usually a few words each.
+`"stream": true` returns OpenAI-style server-sent events (`chat.completion.chunk` deltas, then `data: [DONE]`). `stream_options.include_usage` adds a final usage chunk. Tools work in streaming mode too: a tool call ends the stream with a `tool_calls` delta and `finish_reason: "tool_calls"`. With `json_schema`, the JSON arrives in one chunk. Chunks are as coarse as FoundationModels' snapshots, usually a few words each.
 
 ```bash
 curl -N http://127.0.0.1:8080/v1/chat/completions \
@@ -123,8 +126,49 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 
 Message `content` can be a string or an array of `{"type":"text"}` parts, which are joined with newlines. Images and other non-text parts are rejected with `400`.
 
-If generation fails, the response is still `200`, with an explanatory message. The `finish_reason` is `content_filter` when the model's safety guardrails blocked the request, and `error` otherwise.
+### Usage
 
-Not implemented yet: `n > 1`, `logprobs`, non-text content parts. `usage` token counts are reported as zeros because `FoundationModels` does not surface them.
+`usage` holds real token counts from the model's own tokenizer (`SystemLanguageModel.tokenCount`, macOS 26.4+): `prompt_tokens` covers instructions, tool definitions, history and prompt, and `completion_tokens` covers the generated text or tool calls. On older macOS the counts are zeros. The context window is 4096 tokens for prompt and response combined (see `contextSize` in `/health`).
 
-Note: Apple Foundation Models currently reports `ru_RU` as unsupported on the tested machine, so Russian output may be unreliable even though the endpoint works.
+### Response length (`max_tokens`)
+
+`max_completion_tokens` (or the older `max_tokens`; the newer name wins) caps the reply. When the cap is hit, the reply is truncated and `finish_reason` is `"length"`. Without a cap, the reply is limited to what's left of the context window after the prompt, so a runaway reply also ends as `"length"` instead of failing. A prompt that leaves no room for a reply is a `400 context_length_exceeded` before anything is generated. Detecting `"length"` needs the tokenizer (macOS 26.4+); on older macOS the cap still applies, but `finish_reason` stays `"stop"`.
+
+### Sampling (`temperature`, `top_p`, `seed`)
+
+- `temperature` (0–2) is passed to the model as is.
+- `top_p` (0–1) becomes nucleus sampling; `top_p: 0` is greedy decoding (same reply every time).
+- `seed` makes sampling reproducible: the same request with the same seed gives the same reply.
+
+Out-of-range values are a `400`. The on-device model is fairly deterministic even at default settings, so short answers often don't change much with `temperature`.
+
+### Errors
+
+Errors use OpenAI's format, `{"error":{"message","type","param","code"}}`, so OpenAI SDKs raise typed exceptions:
+
+| Situation | Status | `code` |
+|---|---|---|
+| Invalid request (format, schema, tools, no `user` message) | 400 | `null` |
+| Prompt doesn't fit the context window | 400 | `context_length_exceeded` |
+| Language the model rejects outright | 400 | `unsupported_language` |
+| Schema construct the model can't follow | 400 | `unsupported_schema` |
+| Model busy / rate-limited | 429 | `rate_limit_exceeded` |
+| Model assets not available | 503 | `model_unavailable` |
+| Other generation failure | 500 | `generation_failed` |
+
+Safety blocks are not errors: like OpenAI, the reply is `200` with `content: null` and `finish_reason: "content_filter"`. Once a stream has started, errors arrive as a `data: {"error":{...}}` event (the status is already `200`); a prompt that doesn't fit is rejected before a stream opens, so it's still a 400.
+
+### Language
+
+The proxy detects the language of the latest user message and reports it in response headers:
+
+```
+X-AFP-Detected-Language: ru
+X-AFP-Language-Supported: false
+```
+
+Unsupported languages aren't rejected. Russian, for example, gets answers, just noticeably weaker ones, so this is a signal, not a gate. Short messages (under ~20 letters) aren't classified because detection on them is noise; no headers are sent then.
+
+Not implemented yet: `n > 1`, `logprobs`, non-text content parts.
+
+Note: Apple Foundation Models doesn't support Russian (it's not in `supportedLanguages`). Russian requests still get answers, but they can be unreliable; watch the `X-AFP-Language-Supported` header.

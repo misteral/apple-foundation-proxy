@@ -12,7 +12,7 @@ If you ever want to reuse a session, it must be scoped per logical client (e.g.,
 
 ## Streaming is additive
 
-Non-streaming JSON is the default; `stream: true` opts into SSE per request. Keep it that way, and don't route the non-streaming path through the stream. Once the first SSE byte is sent the status is committed as `200`, so generation errors mid-stream come back as a content chunk plus `finish_reason: "error"`, not an HTTP error. Request validation (schemas, tools, `tool_choice`) runs before the stream opens, so those failures still return `400`. Details: `docs/ARCHITECTURE.md`.
+Non-streaming JSON is the default; `stream: true` opts into SSE per request. Keep it that way, and don't route the non-streaming path through the stream. Once the first SSE byte is sent the status is committed as `200`, so generation errors mid-stream come back as an OpenAI error event, not an HTTP status. A prompt that can't fit is rejected by the response budget before the stream opens, so it still gets a 400. Request validation (schemas, tools, `tool_choice`) runs before the stream opens, so those failures still return `400`. Details: `docs/ARCHITECTURE.md`.
 
 ## Locale support
 
@@ -23,11 +23,11 @@ Observed today on the project owner's machine:
 - `en_US` — supported.
 - `ru_RU` — **unsupported** despite the proxy "working" for Russian text. Output quality is noticeably lower; treat Russian as best-effort, not a feature. Calling code that cares should consult `/health` first.
 
-If `supportsLocale()` returns false for the input's language, the right move is to surface a structured error rather than silently producing degraded output. This is not currently implemented — it's a known gap (see `docs/exec-plans/tech-debt-tracker.md`).
+**Decision: signal, don't block.** The proxy detects the latest user message's language and reports it in `X-AFP-Detected-Language` / `X-AFP-Language-Supported` response headers, with a `notice` in the log when unsupported. It doesn't reject the request, because the owner does use Russian through the proxy and degraded output beats no output. A client that wants strictness can check the header. The only language-related error is when FoundationModels itself refuses (`unsupportedLanguageOrLocale` → `400 unsupported_language`). Mechanics: `docs/ARCHITECTURE.md`.
 
 ## Error handling
 
-- `try await session.respond(to:)` is wrapped in a `do/catch`. On failure the response body contains `Error during generation: <message>` and an error is logged. The HTTP status stays `200` — clients shaped for OpenAI may not check status anyway, and they will see the error in the response text. Revisit if a real client depends on status codes.
+- Generation failures become real HTTP errors in OpenAI's format (`apiError(for:)`: 400 / 429 / 503 / 500 with an `error.code`). Safety blocks are the exception: `200` with `finish_reason: "content_filter"`, as OpenAI does. Inside a running stream, errors arrive as an error event. Table: `docs/ARCHITECTURE.md`.
 - The mock fallback path (no `FoundationModels`) returns a clearly tagged `[Mock Apple Intelligence Response]` string so it is impossible to mistake for real output.
 
 ## Performance constraints

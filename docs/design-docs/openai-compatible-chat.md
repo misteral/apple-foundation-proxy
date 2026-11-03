@@ -17,7 +17,7 @@ The design sections below are kept as the rationale; current behavior is documen
 
 | Path | Purpose | Behavior |
 |------|---------|----------|
-| `POST /v1/chat/completions` | General OpenAI-compatible chat | `messages` → text or structured response, `tools` / `tool_choice`, `stream`. Still open: more sampling options. |
+| `POST /v1/chat/completions` | General OpenAI-compatible chat | `messages` → text or structured response, `tools` / `tool_choice`, `stream`.  |
 | `GET /health` | Capability probe | Existing |
 
 ## Capability matrix
@@ -33,7 +33,8 @@ The design sections below are kept as the rationale; current behavior is documen
 | `response_format: json_schema` | Supported | Translate JSON Schema → `GenerationSchema` at runtime, use `respond(to:schema:...)` → `GeneratedContent` → JSON |
 | `n > 1` | **Not supported** | FM has no batch sampling; reject with 400 |
 | `logprobs` | **Not supported** | FM does not expose token probabilities; field omitted in response |
-| `temperature`, `top_p`, `max_tokens` | Best-effort | Map to `GenerationOptions` where corresponding fields exist; ignore otherwise (with debug log) |
+| `max_tokens`, `max_completion_tokens` | **Implemented** | `GenerationOptions(maximumResponseTokens:)`, clamped to the remaining context; `finish_reason: "length"` when hit |
+| `temperature`, `top_p`, `seed` | **Implemented** | `GenerationOptions(temperature:)`; `top_p` → `SamplingMode.random(probabilityThreshold:seed:)`, `top_p: 0` → `.greedy`; OpenAI ranges validated up front |
 | Vision / audio / multimodal | **Not supported** | Reject with 400 if non-text content parts present |
 | `parallel_tool_calls: false` | Supported (default behavior) | `LanguageModelSession` tools are invoked sequentially |
 | `parallel_tool_calls: true` | Best-effort | Allow framework's natural behavior; document non-determinism |
@@ -113,7 +114,7 @@ OpenAI's `strict: true` flag is taken as a hint that we should reject rather tha
     "streaming": true,
     "toolCalls": true,
     "structuredOutput": true,
-    "supportedLocalesForTools": ["en_US"]
+    "tokenCounting": true
   }
 }
 ```

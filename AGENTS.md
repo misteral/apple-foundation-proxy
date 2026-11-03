@@ -37,6 +37,7 @@ swift build                       # Compile
 swift run                         # Start server on http://127.0.0.1:8080
 swift test                        # Full test suite (Swift Testing)
 swift test --filter <TestName>    # Single test
+AFP_INTEGRATION=1 swift test --filter IntegrationTests   # Opt-in tests against the real model
 ```
 
 Health: `curl http://127.0.0.1:8080/health`.

@@ -27,14 +27,25 @@ The pure helpers in `main.swift` are the high-leverage targets — they are dete
 - `prepareCompletion` — the single place request validation lives, so this is where the `400`-vs-`200` contract is tested (formats, tool definitions, `tool_choice`, tool pipeline selection, prompt with text-fallback tool results).
 - `Message` content decoding — string / `null` / missing / text-part arrays; non-text parts rejected.
 - `makeCompletionResponse`, `mockCompletionOutcome`; gated: `finishReason(for:)` (`content_filter` mapping), `failureOutcome`.
+- Errors — `makeOpenAIErrorBody`, `OpenAIErrorMiddleware` (driven with a throwing responder, no server), `attachingHeaders`; gated: `apiError(for:)` mapping table, `failureOutcome` contract.
+- Language — `detectLanguage` (confident text vs. short / letter-poor text), base-code matching, headers. Detection tests are gated on `canImport(NaturalLanguage)`.
+- Response budget — `responseTokenBudget` (clamping, no-room 400), `finishReason(completionTokens:budget:)`, `max_tokens` / `max_completion_tokens` parsing and validation.
 - Streaming helpers — `streamDelta` (prefix, divergence, multi-byte), `sseEvent` framing, `ChunkFactory` chunk shapes (explicit `finish_reason: null`, omitted unset delta fields, indexed tool calls, usage trailer).
 
 The `buildGenerationSchema(from:)` bridge requires `FoundationModels` types, so its tests are gated behind `#if canImport(FoundationModels)` and skip at runtime via `#available(macOS 26.0, *)` on older OSes. Cover both happy paths (object/array/enum/scalar) and the rejection cases (`oneOf`/`anyOf`/`allOf`/`$ref`/`pattern`/`format`/`additionalProperties`, missing `items`, unknown `type`, non-object fragment, missing `schema`).
 
 ## What not to test in unit tests
 
-- The actual `LanguageModelSession.respond(to:)` call. It is non-deterministic, requires Apple Intelligence, and is an integration concern — exercise it manually via `curl` or a smoke script, not via CI.
+- The actual `LanguageModelSession.respond(to:)` call in the default run: it is non-deterministic and needs Apple Intelligence. That's what the opt-in integration suite is for (below).
 - The `#if canImport(FoundationModels)` branches. They are compile-time switches; covering them needs two toolchains, not two test cases.
+
+## Integration tests (opt-in, real model)
+
+```bash
+AFP_INTEGRATION=1 swift test --filter IntegrationTests
+```
+
+`Tests/apple-foundation-proxyTests/IntegrationTests.swift` runs against Apple Intelligence through the handler's own functions (`prepareCompletion` → `makeCompletionSession` → `generateCompletion`). It covers schema-conforming output (types, enum, array bounds), a tool round-trip, real `usage`, context overflow (FoundationModels' own error and the budget's up-front 400), `max_tokens` → `length`, and the runaway-reply regression (fills the window → now `length`, not an error). Assertions are structural, so they hold despite sampling. The suite is disabled without the env var, so the default `swift test` and CI never touch the model.
 
 ## Manual smoke test
 

@@ -687,10 +687,12 @@ import FoundationModels
         #expect(calls.allSatisfy { $0.type == "function" && $0.id.hasPrefix("call_") })
     }
 
-    @Test func usageChunkHasEmptyChoices() throws {
-        let obj = try decode(factory.usage())
+    @Test func usageChunkHasEmptyChoicesAndCarriesUsage() throws {
+        let obj = try decode(factory.usage(.init(prompt_tokens: 30, completion_tokens: 11, total_tokens: 41)))
         #expect(obj["choices"] == .array([]))
-        #expect(obj["usage"]?.objectValue?["total_tokens"] == .int(0))
+        #expect(obj["usage"] == .object([
+            "prompt_tokens": .int(30), "completion_tokens": .int(11), "total_tokens": .int(41),
+        ]))
     }
 }
 
@@ -782,6 +784,63 @@ import FoundationModels
         #expect(p.prompt == "weather?\n\nTool results:\n- get_weather({}): Sunny")
     }
 
+    @Test func maxTokensParsingAndValidation() throws {
+        #expect(try prepare(#"{"messages":[{"role":"user","content":"hi"}]}"#).maxTokens == nil)
+        #expect(try prepare(#"{"max_tokens":20,"messages":[{"role":"user","content":"hi"}]}"#).maxTokens == 20)
+        #expect(try prepare(#"{"max_tokens":5,"max_completion_tokens":30,"messages":[{"role":"user","content":"hi"}]}"#).maxTokens == 30)
+        #expect(throws: Abort.self) {
+            try prepare(#"{"max_tokens":0,"messages":[{"role":"user","content":"hi"}]}"#)
+        }
+    }
+
+    @Test func samplingParsingAndValidation() throws {
+        let m = #""messages":[{"role":"user","content":"hi"}]"#
+        #expect(try prepare("{\(m)}").sampling == SamplingParameters())
+        let p = try prepare(#"{"temperature":0.7,"top_p":0.9,"seed":-1,"# + m + "}")
+        #expect(p.sampling == SamplingParameters(temperature: 0.7, topP: 0.9, seed: UInt64.max))
+        for bad in [#""temperature":2.5"#, #""temperature":-0.1"#, #""top_p":1.5"#, #""top_p":-1"#] {
+            #expect(throws: Abort.self) { try prepare("{\(bad),\(m)}") }
+        }
+    }
+
+    @Test func samplingMode() {
+        #expect(SamplingParameters().mode == nil)
+        #expect(SamplingParameters(temperature: 1.2).mode == nil)
+        #expect(SamplingParameters(topP: 1).mode == nil)
+        #expect(SamplingParameters(topP: 0).mode == .greedy)
+        #expect(SamplingParameters(topP: 0, seed: 7).mode == .greedy)
+        #expect(SamplingParameters(topP: 0.9).mode == .nucleus(threshold: 0.9, seed: nil))
+        #expect(SamplingParameters(seed: 7).mode == .nucleus(threshold: 1, seed: 7))
+        #expect(SamplingParameters(topP: 1, seed: 7).mode == .nucleus(threshold: 1, seed: 7))
+    }
+
+    @Test func rejectsRequestsWithoutUserMessage() {
+        #expect(throws: Abort.self) {
+            try prepare(#"{"messages":[{"role":"system","content":"s"},{"role":"assistant","content":"a"}]}"#)
+        }
+    }
+
+    #if canImport(NaturalLanguage)
+    @Test func detectsLanguageOfLatestUserMessage() throws {
+        let p = try prepare(#"{"messages":[{"role":"user","content":"What is the weather going to be like in Paris tomorrow?"},{"role":"assistant","content":"Sunny."},{"role":"user","content":"Привет! Расскажи коротко, почему небо голубое?"}]}"#)
+        #expect(p.detectedLanguage == "ru")
+        #expect(try prepare(#"{"messages":[{"role":"user","content":"hi"}]}"#).detectedLanguage == nil)
+    }
+    #endif
+
+    @Test func pendingResultsAreAlsoInPromptWhenToolsAreActive() throws {
+        let p = try prepare(#"""
+        {"messages":[
+          {"role":"user","content":"weather?"},
+          {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},
+          {"role":"tool","tool_call_id":"c1","content":"Sunny"}
+        ],"tools":[\#(weatherTool)]}
+        """#)
+        #expect(p.activeTools.count == 1)
+        #expect(p.conversation?.pendingResults.count == 1)
+        #expect(p.prompt == "weather?\n\nTool results:\n- get_weather({}): Sunny")
+    }
+
     @Test func toolValidationErrors() {
         #expect(throws: Abort.self) {
             try prepare(#"{"messages":[{"role":"user","content":"hi"}],"tool_choice":"required"}"#)
@@ -792,6 +851,129 @@ import FoundationModels
         #expect(throws: Abort.self) {
             try prepare(#"{"messages":[{"role":"system","content":"s"}],"tools":[\#(weatherTool)]}"#)
         }
+    }
+}
+
+// MARK: - OpenAI-style errors
+
+@Suite struct OpenAIErrorTests {
+    @Test func bodyShapeAndTypes() throws {
+        let body = makeOpenAIErrorBody(status: .badRequest, message: "bad", code: nil)
+        let obj = try #require(try JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(body)).objectValue)
+        #expect(obj["error"] == .object([
+            "message": .string("bad"), "type": .string("invalid_request_error"), "param": .null, "code": .null,
+        ]))
+        #expect(makeOpenAIErrorBody(status: .tooManyRequests, message: "", code: nil).error.type == "rate_limit_error")
+        #expect(makeOpenAIErrorBody(status: .serviceUnavailable, message: "", code: nil).error.type == "server_error")
+    }
+
+    private func run(_ error: Error) async throws -> (Response, OpenAIErrorBody) {
+        let app = try await Application.make(.testing)
+        let request = Request(application: app, on: app.eventLoopGroup.next())
+        struct Failing: AsyncResponder {
+            let error: Error
+            func respond(to request: Request) async throws -> Response { throw error }
+        }
+        let response = try await OpenAIErrorMiddleware().respond(to: request, chainingTo: Failing(error: error))
+        let body = try response.content.decode(OpenAIErrorBody.self)
+        try await app.asyncShutdown()
+        return (response, body)
+    }
+
+    @Test func middlewareFormatsProxyErrorsWithCodeAndHeaders() async throws {
+        var headers = HTTPHeaders()
+        headers.add(name: detectedLanguageHeader, value: "ru")
+        let (response, body) = try await run(ProxyAPIError(status: .badRequest, reason: "too long", code: "context_length_exceeded", headers: headers))
+        #expect(response.status == .badRequest)
+        #expect(response.headers.first(name: detectedLanguageHeader) == "ru")
+        #expect(body.error == .init(message: "too long", type: "invalid_request_error", param: nil, code: "context_length_exceeded"))
+    }
+
+    @Test func middlewareFormatsAbortAndUnknownErrors() async throws {
+        let (abortResponse, abortBody) = try await run(Abort(.badRequest, reason: "nope"))
+        #expect(abortResponse.status == .badRequest)
+        #expect(abortBody.error.message == "nope")
+
+        struct Opaque: Error {}
+        let (opaqueResponse, opaqueBody) = try await run(Opaque())
+        #expect(opaqueResponse.status == .internalServerError)
+        #expect(opaqueBody.error.type == "server_error")
+    }
+
+    @Test func attachingHeadersWrapsAbortErrors() throws {
+        var extra = HTTPHeaders()
+        extra.add(name: languageSupportedHeader, value: "false")
+        let wrapped = try #require(attachingHeaders(extra, to: Abort(.badRequest, reason: "x")) as? ProxyAPIError)
+        #expect(wrapped.status == .badRequest)
+        #expect(wrapped.headers.first(name: languageSupportedHeader) == "false")
+        struct Opaque: Error {}
+        #expect(!(attachingHeaders(extra, to: Opaque()) is ProxyAPIError))
+        #expect(attachingHeaders([:], to: Abort(.badRequest)) is Abort)
+    }
+}
+
+// MARK: - Language detection
+
+@Suite struct LanguageDetectionTests {
+    #if canImport(NaturalLanguage)
+    @Test func detectsConfidentLongEnoughText() {
+        #expect(detectLanguage(in: "Привет! Расскажи коротко, почему небо голубое?") == "ru")
+        #expect(detectLanguage(in: "What is the weather going to be like in Paris tomorrow?") == "en")
+        #expect(detectLanguage(in: "Erkläre mir bitte kurz, warum der Himmel blau ist.") == "de")
+    }
+    #endif
+
+    @Test func shortOrLetterPoorTextIsUnknown() {
+        // NaturalLanguage alone guesses "hi" → Catalan, "ok" → Polish.
+        #expect(detectLanguage(in: "hi") == nil)
+        #expect(detectLanguage(in: "ok") == nil)
+        #expect(detectLanguage(in: #"{"a": 1, "b": [2, 3]}"#) == nil)
+    }
+
+    @Test func supportMatchesOnBaseLanguageCode() {
+        #expect(baseLanguageCode("zh-Hans") == "zh")
+        #expect(baseLanguageCode("pt-BR") == "pt")
+        let supported: Set<String> = ["en", "de", "zh"]
+        #expect(isLanguageSupported("zh-Hant", supportedCodes: supported))
+        #expect(isLanguageSupported("en", supportedCodes: supported))
+        #expect(!isLanguageSupported("ru", supportedCodes: supported))
+    }
+
+    @Test func headersOnlyWhenDetected() {
+        #expect(languageHeaders(detected: nil, supported: nil).isEmpty)
+        let h = languageHeaders(detected: "ru", supported: false)
+        #expect(h.first(name: detectedLanguageHeader) == "ru")
+        #expect(h.first(name: languageSupportedHeader) == "false")
+    }
+}
+
+// MARK: - Response token budget
+
+@Suite struct ResponseBudgetTests {
+    @Test func clampsRequestedCapToRemainingContext() throws {
+        // 4096 − 1000 − margin(128) = 2968 left.
+        #expect(try responseTokenBudget(requested: nil, promptTokens: 1000, contextSize: 4096) == 2968)
+        #expect(try responseTokenBudget(requested: 50, promptTokens: 1000, contextSize: 4096) == 50)
+        #expect(try responseTokenBudget(requested: 10_000, promptTokens: 1000, contextSize: 4096) == 2968)
+    }
+
+    @Test func promptThatLeavesNoRoomIsContextLengthExceeded() {
+        do {
+            _ = try responseTokenBudget(requested: nil, promptTokens: 4096 - responseTokenMargin, contextSize: 4096)
+            Issue.record("expected an error")
+        } catch let error as ProxyAPIError {
+            #expect(error.status == .badRequest)
+            #expect(error.code == "context_length_exceeded")
+        } catch {
+            Issue.record("unexpected \(error)")
+        }
+    }
+
+    @Test func lengthOnlyWhenBudgetIsUsedUp() {
+        #expect(finishReason(completionTokens: 20, budget: 20) == "length")
+        #expect(finishReason(completionTokens: 1007, budget: 1008) == "length")  // boundary tolerance
+        #expect(finishReason(completionTokens: 11, budget: 2968) == "stop")
+        #expect(finishReason(completionTokens: 500, budget: nil) == "stop")
     }
 }
 
@@ -814,6 +996,15 @@ import FoundationModels
         #expect(calls.map(\.function.name) == ["f"])
         #expect(calls.first?.id.hasPrefix("call_") == true)
         #expect(r.choices.first?.finish_reason == "tool_calls")
+    }
+
+    @Test func usageAndCompletionText() {
+        var outcome = CompletionOutcome.text("hi")
+        outcome.usage = .init(prompt_tokens: 3, completion_tokens: 1, total_tokens: 4)
+        #expect(makeCompletionResponse(outcome, id: "id", created: 1, model: "m").usage == outcome.usage)
+        #expect(outcome.completionText == "hi")
+        let calls = CompletionOutcome(content: nil, toolCalls: [.init(name: "f", arguments: "{}"), .init(name: "g", arguments: "{}")], finishReason: "tool_calls")
+        #expect(calls.completionText == "f({})\ng({})")
     }
 
     @Test func mockOutcomeDependsOnFormat() throws {
@@ -909,23 +1100,45 @@ import FoundationModels
         #expect(kinds == ["instructions(1)", "prompt", "toolCalls(1)", "toolOutput(get_weather)", "response"])
     }
 
-    @Test func safetyErrorsMapToContentFilter() throws {
+    @Test func generationErrorsMapToHTTPErrors() throws {
         guard #available(macOS 26.0, *) else { return }
         typealias GE = LanguageModelSession.GenerationError
-        let ctx = GE.Context(debugDescription: "t")
-        #expect(finishReason(for: GE.guardrailViolation(ctx)) == "content_filter")
-        #expect(finishReason(for: GE.exceededContextWindowSize(ctx)) == "error")
-        #expect(finishReason(for: Abort(.internalServerError)) == "error")
+        let ctx = GE.Context(debugDescription: "Content contains 5907 tokens")
+        #expect(apiError(for: GE.guardrailViolation(ctx)) == nil)
+        let cases: [(GE, UInt, String)] = [
+            (.exceededContextWindowSize(ctx), 400, "context_length_exceeded"),
+            (.unsupportedLanguageOrLocale(ctx), 400, "unsupported_language"),
+            (.unsupportedGuide(ctx), 400, "unsupported_schema"),
+            (.rateLimited(ctx), 429, "rate_limit_exceeded"),
+            (.concurrentRequests(ctx), 429, "rate_limit_exceeded"),
+            (.assetsUnavailable(ctx), 503, "model_unavailable"),
+            (.decodingFailure(ctx), 500, "generation_failed"),
+        ]
+        for (error, status, code) in cases {
+            let mapped = try #require(apiError(for: error))
+            #expect(mapped.status.code == status)
+            #expect(mapped.code == code)
+            #expect(mapped.reason == "Content contains 5907 tokens")
+        }
+        #expect(apiError(for: Abort(.imATeapot))?.status == .internalServerError)
     }
 
-    @Test func failureOutcomePrefersRecordedToolCalls() throws {
+    @Test func failureOutcomeContract() throws {
         guard #available(macOS 26.0, *) else { return }
+        typealias GE = LanguageModelSession.GenerationError
         let recorder = ToolInvocationRecorder()
         let logger = Logger(label: "test")
-        let ctx = LanguageModelSession.GenerationError.Context(debugDescription: "t")
-        #expect(failureOutcome(LanguageModelSession.GenerationError.guardrailViolation(ctx), recorder: recorder, logger: logger).finishReason == "content_filter")
+        let ctx = GE.Context(debugDescription: "t")
+
+        let filtered = try failureOutcome(GE.guardrailViolation(ctx), recorder: recorder, logger: logger)
+        #expect(filtered == CompletionOutcome(content: nil, toolCalls: [], finishReason: "content_filter"))
+
+        #expect(throws: ProxyAPIError.self) {
+            try failureOutcome(GE.exceededContextWindowSize(ctx), recorder: recorder, logger: logger)
+        }
+
         recorder.record(name: "f", arguments: "{}")
-        let outcome = failureOutcome(ProxyToolInvocation(name: "f", arguments: "{}"), recorder: recorder, logger: logger)
+        let outcome = try failureOutcome(ProxyToolInvocation(name: "f", arguments: "{}"), recorder: recorder, logger: logger)
         #expect(outcome == CompletionOutcome(content: nil, toolCalls: [.init(name: "f", arguments: "{}")], finishReason: "tool_calls"))
     }
 

@@ -16,10 +16,10 @@ Two endpoints, both on `127.0.0.1:8080`:
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET`  | `/health` | Reports `FoundationModels` import status, runtime availability, and which locales `SystemLanguageModel.default` supports on the host. |
+| `GET`  | `/health` | Reports `FoundationModels` import status, runtime availability, supported languages, context size, and capabilities (including whether token counting is available). |
 | `POST` | `/v1/chat/completions` | OpenAI-shaped request/response envelope. Generates text from `messages` via `LanguageModelSession`. Supports `response_format` and `tools` / `tool_choice`. |
 
-The OpenAI compatibility covers text generation, structured output (`response_format`), and client-executed tool calls (`tools` / `tool_choice`). Streaming (`stream: true`) is supported for all of the above. Missing on purpose for now: `n > 1`, `logprobs`, non-text content parts. `usage` is returned with zero counts because `FoundationModels` does not expose token usage.
+The OpenAI compatibility covers text generation, structured output (`response_format`), and client-executed tool calls (`tools` / `tool_choice`). Streaming (`stream: true`) is supported for all of the above. Missing on purpose for now: `n > 1`, `logprobs`, non-text content parts. `usage` is counted with the model's own tokenizer on macOS 26.4+ (zeros below).
 
 ## Request pipeline for `/v1/chat/completions`
 
@@ -36,6 +36,7 @@ Message `content` may be a string, `null`, or an array of parts. Text parts are 
 
 Steps inside `prepareCompletion` and `makeCompletionSession`:
 
+0. **Require a `user` message**; requests without one are a `400`.
 1. **Validate `response_format.type`** (one of `text` / `json_object` / `json_schema`); reject unknown values with `400`. For `json_schema`, require a `json_schema` payload.
 2. **`systemInstructions`** — joins all `system` and `developer` role messages into one instructions block (newline-separated). Returns nil when the request has none.
 3. **`augmentInstructionsForJSONObject`** — when `type == "json_object"`, append a "respond with JSON only" directive to the instructions. FoundationModels has no native JSON mode, so this is best-effort.
@@ -45,7 +46,49 @@ Steps inside `prepareCompletion` and `makeCompletionSession`:
 7. **Generate.** When a schema is present, call `respond(to:schema:)` and return `response.content.jsonString` as `choices[0].message.content`. Otherwise call `respond(to:)` and return the text response.
 8. **Stream** (only when `stream: true`) — instead of step 7, return an SSE response; see below.
 
-Generation errors are returned as `200` with an `Error during generation: ...` message, mapped by `finishReason(for:)`: `guardrailViolation` and `refusal` become the standard `content_filter`, and everything else becomes `error`. `error` isn't an OpenAI value; see the tech-debt tracker.
+### Errors
+
+`OpenAIErrorMiddleware` replaces Vapor's `ErrorMiddleware` (request logging is kept), so every error leaves the server as `{"error":{"message","type","param","code"}}`. `type` comes from the status: `invalid_request_error` for 4xx, `rate_limit_error` for 429, `server_error` for 5xx. Errors that need a `code` are `ProxyAPIError`.
+
+Generation failures go through `apiError(for:)`. The message is the error context's debug description, which is specific (token counts and limit):
+
+| `GenerationError` | Result |
+|---|---|
+| `guardrailViolation`, `refusal` | Not an error: `200`, `content: null`, `finish_reason: "content_filter"` (OpenAI's behavior) |
+| `exceededContextWindowSize` | 400 `context_length_exceeded` |
+| `unsupportedLanguageOrLocale` | 400 `unsupported_language` |
+| `unsupportedGuide` | 400 `unsupported_schema` |
+| `rateLimited`, `concurrentRequests` | 429 `rate_limit_exceeded` |
+| `assetsUnavailable` | 503 `model_unavailable` |
+| `decodingFailure`, anything else | 500 `generation_failed` |
+
+### Usage
+
+`measureUsage` uses `SystemLanguageModel.tokenCount` (macOS 26.4+, ~20 ms a call):
+
+- `prompt_tokens` is the session transcript through the latest prompt entry: instructions, tool definitions, history, prompt.
+- `completion_tokens` is the generated text, or the tool-call names and arguments. `tokenCount(for: String)` adds a fixed prompt wrapper (8 tokens on 26.6), so the empty-string baseline is subtracted.
+- Replayed tool round-trips after the prompt aren't counted, so tool turns report a close lower bound.
+- Counting failures fall back to zeros and never fail the request. Streams count only when `include_usage` is set.
+
+### Response token budget
+
+`applyResponseBudget` runs for every request, streaming or not, before generation starts. It counts the transcript plus prompt and sets `GenerationOptions(maximumResponseTokens:)` to `responseTokenBudget`: the client's `max_completion_tokens ?? max_tokens`, clamped to `contextSize − prompt − responseTokenMargin`.
+
+Why it exists: FoundationModels doesn't check the window up front. It generates until the window fills and then throws `exceededContextWindowSize`, so a runaway reply to a short prompt used to surface as "context length exceeded". With the budget, the model truncates instead.
+
+- **Truncation is silent.** The model stops exactly at the cap, so `finish_reason: "length"` is inferred by counting the output (`finishReason(completionTokens:budget:)`, with a 1-token tolerance because re-tokenizing can land one off).
+- **Margin.** `responseTokenMargin` is 128 because the real limit sits below the nominal 4096: on macOS 26.6 a 16-token margin still failed ("4091 tokens exceeds 4096"), and 128 reached the cap cleanly.
+- **No room left.** A prompt that leaves no room is a `400 context_length_exceeded` before generating.
+- **Below macOS 26.4** there's no tokenizer: only the client's cap is applied, and `length` can't be detected.
+
+### Sampling
+
+`samplingParameters(from:)` validates `temperature` (0–2) and `top_p` (0–1) against OpenAI's ranges in `prepareCompletion`, because FoundationModels fails out-of-range values mid-generation with an opaque error (`top_p: 1.5` → `com.apple.tokengeneration Code=8`). `CompletionSession.options` maps them to `GenerationOptions`: `temperature` as is, and `SamplingParameters.mode` picks the `SamplingMode`. `top_p: 0` → `.greedy`; `top_p` or `seed` → `.random(probabilityThreshold: top_p ?? 1, seed:)`; neither → the model default. A seed gives reproducible replies (checked in `IntegrationTests`).
+
+### Language signal
+
+`detectLanguage` (NaturalLanguage, system framework) classifies the latest `user` message and returns nil under 20 letters or below 0.8 confidence: on short text NaturalLanguage guesses `hi` → Catalan. The detected code is compared by base language (`zh-Hans` → `zh`) against `SystemLanguageModel.supportedLanguages`. The result goes into `X-AFP-Detected-Language` / `X-AFP-Language-Supported` headers, including on error responses (`attachingHeaders`), plus a `notice` log line when unsupported (not `warning`: it fires on every such request). Requests are never rejected for language; see `docs/RELIABILITY.md`.
 
 Without `tools`, history is prompt-stuffed (step 4). With `tools`, the pipeline switches to a native `Transcript` — see below.
 
@@ -59,7 +102,7 @@ OpenAI tools are executed by the **client**; FoundationModels tools are executed
 4. **`buildTranscript`** — history becomes native `Transcript` entries: instructions (with tool definitions), prompts, responses, `toolCalls`, `toolOutput`. The session is `LanguageModelSession(tools:transcript:)`.
 5. **Generate.** When the model calls a tool, `ProxyTool.call` either returns a pending client result from `ToolReplayCache` (replaying the round-trip), or records the call in `ToolInvocationRecorder` and throws `ProxyToolInvocation` to abort generation. Any non-empty recorder after a thrown error → response with `content: null`, `tool_calls`, `finish_reason: "tool_calls"`.
 
-Replay matching (`ToolReplayCache`): exact `(name, arguments)` first (order-insensitive JSON compare), then the same comparison on normalized arguments (`normalizedForMatching`: strings trimmed, lowercased, whitespace collapsed; `2.0` == `2`), because regeneration may vary casing or spacing. Matches are reusable. There is no name-only fallback, because it would hand one call's result to a different call (Paris weather for London). An unmatched call goes back to the client as a new `tool_calls`. Pending results for tools not attached this turn (e.g. `tool_choice: "none"`) are appended to the prompt as text.
+Replay matching (`ToolReplayCache`): exact `(name, arguments)` first (order-insensitive JSON compare), then the same comparison on normalized arguments (`normalizedForMatching`: strings trimmed, lowercased, whitespace collapsed; `2.0` == `2`), because regeneration may vary casing or spacing. Matches are reusable. There is no name-only fallback, because it would hand one call's result to a different call (Paris weather for London). An unmatched call goes back to the client as a new `tool_calls`. Pending results are *also* appended to the prompt as text (`appendToolResultsToPrompt`). Replay alone would lose them if the model answered without calling the tool again; with both, the result reaches the model either way. Verified on device: replay answers stay correct with the duplicated results (single and parallel calls).
 
 Tool-call IDs are generated per response (`call_<24 hex>`); they are not stable across requests, which matches OpenAI.
 
@@ -69,15 +112,15 @@ The non-streaming path stays the default; streaming is opt-in per request. The r
 
 1. A role chunk: `delta: {role: "assistant", content: ""}`.
 2. Content chunks from `session.streamResponse(to:)`. FoundationModels yields **cumulative snapshots**, not deltas; `streamDelta(previous:current:)` turns them into the incremental `delta.content` OpenAI clients expect. If a snapshot ever stops extending the previous one, the text after the common prefix is sent (SSE can't take back text).
-3. A finish chunk with an empty `delta` and `finish_reason` (`stop`, `tool_calls`, `content_filter`, or `error`). Non-final chunks carry `finish_reason: null` explicitly.
-4. With `stream_options.include_usage: true`, a usage chunk (`choices: []`, zeros).
+3. A finish chunk with an empty `delta` and `finish_reason` (`stop`, `tool_calls`, or `content_filter`). Non-final chunks carry `finish_reason: null` explicitly.
+4. With `stream_options.include_usage: true`, a usage chunk (`choices: []`, counts as above).
 5. `data: [DONE]`.
 
 Tools: `streamResponse` invokes `Tool.call` mid-stream (verified on device), so `ProxyTool` behaves exactly as in the non-streaming path. A recorded invocation ends the stream with one `tool_calls` delta chunk (all calls, `index`ed) and `finish_reason: "tool_calls"`. Any text streamed before the call stays sent.
 
 `json_schema` with `stream: true` is generated in full and sent as a single content chunk. Partial `GeneratedContent` snapshots re-serialize with the closing braces in different places, so they don't form a prefix-stable JSON text stream.
 
-A failed SSE write (client disconnected) is told apart from a generation error (`StreamWriteFailed`). It ends the stream quietly, without an error chunk or error log. Errors mid-stream mirror the non-streaming path: an `Error during generation: ...` content chunk plus `finish_reason` from `finishReason(for:)`. HTTP status is already `200` by then.
+A failed SSE write (client disconnected) is told apart from a generation error (`StreamWriteFailed`). It ends the stream quietly, without an error chunk or error log. Before the stream opens, `applyResponseBudget` (below) rejects a prompt that can't fit with a real `400 context_length_exceeded`. After that the status is committed as `200`, so any other generation error is sent as an OpenAI error event (`data: {"error":{...}}`) followed by `[DONE]`, with no finish chunk. OpenAI SDKs raise it as an `APIError`.
 
 ## Supported JSON Schema subset (for `response_format.json_schema`)
 
