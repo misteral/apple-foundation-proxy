@@ -15,6 +15,7 @@ This is a map, not a manual. Detail lives in `docs/`. Read the relevant doc on d
 | [docs/TESTING.md](docs/TESTING.md) | Running tests, writing tests (Swift Testing, not XCTest) |
 | [docs/SECURITY.md](docs/SECURITY.md) | Before exposing the server beyond `127.0.0.1` or adding auth |
 | [docs/RELIABILITY.md](docs/RELIABILITY.md) | Before adding state across requests, streaming, or new locales |
+| [docs/CONTEXT_WINDOW.md](docs/CONTEXT_WINDOW.md) | Context-window limits (26.x vs OS 27 / PCC), and wiring up clients such as pi |
 | [docs/design-docs/index.md](docs/design-docs/index.md) | Catalogue of design decisions |
 | [docs/exec-plans/active/](docs/exec-plans/active/) | In-progress execution plans — read before starting work that overlaps |
 | [docs/exec-plans/tech-debt-tracker.md](docs/exec-plans/tech-debt-tracker.md) | Known debt before starting non-trivial work |

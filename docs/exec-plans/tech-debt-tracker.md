@@ -18,7 +18,7 @@ Priority: `P0` blocks correctness, `P1` blocks a real use case, `P2` is hygiene.
 
 ## Active items
 
-_None._
+- **[P2] A streaming tool request from pi hung once with no response.** Seen 2026-11-06: one request got nothing for about 4 minutes while the proxy kept serving other requests. The identical request succeeded on retry. The cause is unknown, possibly a stalled FoundationModels stream. A generation timeout would turn a hang into an error. Details in `docs/CONTEXT_WINDOW.md`.
 
 ---
 
